@@ -1,0 +1,918 @@
+// Poster agent — Firestore logic, Engage schema. No browser, no side effects.
+//
+// This is the half of the agent that changed in the port from ML Studio: the
+// collection paths. Everything is keyed off the job (which carries projectId),
+// so it maps cleanly onto Engage's nested model:
+//
+//   ML Studio (flat)            Engage (nested / renamed)
+//   reddit_agent_status/agent   agents/agent
+//   reddit_post_jobs            jobs
+//   reddit_accounts             accounts
+//   reddit_drafts/{id}          projects/{projectId}/drafts/{id}
+//   reddit_posts/{postId}       projects/{projectId}/items/{postId}   (postId == itemId)
+//
+// db / FieldValue / Timestamp are injected so this module has no dependency on a
+// firebase-admin instance and can be exercised by the self-test.
+
+import { findConflict, isLive, jobPlatform, nextDueAtMs, orderCandidates } from './scheduler.mjs';
+
+export const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Same rails as the app's accountPostGate, evaluated on the agent's fresh read
+ *  of the account. `hard` blocks kill the job; a soft block (interval) defers. */
+export function gate(account, nowMs) {
+  const resetMs = account.postCountResetAt?.toMillis?.() ?? 0;
+  const windowExpired = !resetMs || nowMs - resetMs >= DAY_MS;
+  const usedToday = windowExpired ? 0 : account.postCountToday || 0;
+  const remaining = Math.max(0, (account.dailyCap || 0) - usedToday);
+  const lastMs = account.lastPostAt?.toMillis?.() ?? 0;
+  const intervalMs = (account.minIntervalMinutes || 0) * 60 * 1000;
+  if (account.status === 'banned') return { ok: false, hard: true, reason: 'Account banned.' };
+  if (account.status === 'flagged') return { ok: false, hard: true, reason: 'Account flagged.' };
+  if (remaining <= 0) return { ok: false, hard: true, reason: `Daily cap reached (${account.dailyCap}).` };
+  // `retryAtMs` is WHEN the interval clears, so a deferred job can wait until
+  // then instead of being claimed, re-checked and put back every poll.
+  if (lastMs && nowMs - lastMs < intervalMs)
+    return {
+      ok: false,
+      hard: false,
+      reason: `Min interval not elapsed (${account.minIntervalMinutes}m).`,
+      retryAtMs: lastMs + intervalMs,
+    };
+  return { ok: true };
+}
+
+/**
+ * The COMMENT rails, on the comment counters.
+ *
+ * A karma comment must not spend a reply slot — `dailyCap`/`postCountToday`
+ * belong to the thing the account exists for, and letting warm-up comments eat
+ * them would throttle real replies invisibly. So this reads the parallel set
+ * (`commentCountToday`, `commentCountResetAt`, `lastCommentAt`) and the caps
+ * from `account.commentKarma`.
+ *
+ * DELIBERATELY NARROWER THAN THE APP'S commentGate(). The per-subreddit rail
+ * needs the account's recent comment history, which the app already has loaded
+ * at enqueue time and the agent would have to query for; it is enforced there.
+ * What is re-checked here is what can have CHANGED while the job sat on the
+ * queue: status, the daily caps, and the interval.
+ */
+export function commentGate(account, nowMs) {
+  const settings = account.commentKarma || {};
+  const dailyCap = Number(settings.dailyCap) || 3;
+  const combinedCap = Number(settings.combinedDailyCap) || 6;
+  const intervalMin = Number(settings.minIntervalMinutes) || 90;
+
+  const used = (count, resetAt) => {
+    const resetMs = resetAt?.toMillis?.() ?? 0;
+    return !resetMs || nowMs - resetMs >= DAY_MS ? 0 : count || 0;
+  };
+  const commentsToday = used(account.commentCountToday, account.commentCountResetAt);
+  // Read, never written.
+  const postsToday = used(account.postCountToday, account.postCountResetAt);
+
+  if (account.status === 'banned') return { ok: false, hard: true, reason: 'Account banned.' };
+  if (account.status === 'flagged') return { ok: false, hard: true, reason: 'Account flagged.' };
+  if (commentsToday >= dailyCap)
+    return { ok: false, hard: true, reason: `Comment cap reached (${dailyCap}/day).` };
+  if (commentsToday + postsToday >= combinedCap)
+    return {
+      ok: false,
+      hard: true,
+      reason: `Combined ceiling reached (${commentsToday + postsToday} of ${combinedCap} actions today).`,
+    };
+
+  const lastMs = account.lastCommentAt?.toMillis?.() ?? 0;
+  if (lastMs && nowMs - lastMs < intervalMin * 60 * 1000)
+    return {
+      ok: false,
+      hard: false,
+      reason: `Min comment interval not elapsed (${intervalMin}m).`,
+      retryAtMs: lastMs + intervalMin * 60 * 1000,
+    };
+  return { ok: true };
+}
+
+/** The comment counter advance. Mirrors nextCounters on the parallel fields. */
+export function nextCommentCounters(account, nowMs, Timestamp, FieldValue) {
+  const resetMs = account.commentCountResetAt?.toMillis?.() ?? 0;
+  const windowExpired = !resetMs || nowMs - resetMs >= DAY_MS;
+  return {
+    commentCountToday: (windowExpired ? 0 : account.commentCountToday || 0) + 1,
+    commentCountResetAt: windowExpired ? Timestamp.fromMillis(nowMs) : account.commentCountResetAt,
+    lastCommentAt: Timestamp.fromMillis(nowMs),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+}
+
+/** Rolling-window counter advance, mirroring the app so UI and agent agree. */
+export function nextCounters(account, nowMs, Timestamp, FieldValue) {
+  const resetMs = account.postCountResetAt?.toMillis?.() ?? 0;
+  const windowExpired = !resetMs || nowMs - resetMs >= DAY_MS;
+  return {
+    postCountToday: (windowExpired ? 0 : account.postCountToday || 0) + 1,
+    postCountResetAt: windowExpired ? Timestamp.fromMillis(nowMs) : account.postCountResetAt,
+    lastPostAt: Timestamp.fromMillis(nowMs),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+}
+
+export function createStore({ db, FieldValue, Timestamp }) {
+  const jobs = () => db.collection('jobs');
+  const agentDoc = () => db.collection('agents').doc('agent');
+  const controlDoc = () => db.collection('agents').doc('control');
+  const accountRef = (id) => db.collection('accounts').doc(id);
+  const draftRef = (projectId, draftId) => db.collection('projects').doc(projectId).collection('drafts').doc(draftId);
+  const itemRef = (projectId, itemId) => db.collection('projects').doc(projectId).collection('items').doc(itemId);
+  // Karma comments live under the ACCOUNT, not a project — they belong to the
+  // identity rather than to any client's work.
+  const commentDraftRef = (accountId, draftId) =>
+    db.collection('accounts').doc(accountId).collection('commentDrafts').doc(draftId);
+
+  return {
+    accountRef,
+
+    /** Read agents/control ONCE per poll.
+     *
+     *  `{ ok: true, data }` on a successful read (data is {} when the doc does not
+     *  exist yet), `{ ok: false, error }` when the read FAILED. The two must stay
+     *  distinguishable: resolveDryRun() treats a failure as dry run, where the old
+     *  readDryRunOverride() returned null for both and a failure fell through to
+     *  the env default — live, when DRY_RUN was unset. */
+    async readControl() {
+      try {
+        const snap = await controlDoc().get();
+        return { ok: true, data: snap.exists ? snap.data() : {} };
+      } catch (e) {
+        return { ok: false, error: e?.message || String(e) };
+      }
+    },
+
+    /** Seed the control doc once so the UI has a value to toggle. create() fails
+     *  if it already exists, so an operator's earlier choice is never clobbered. */
+    async ensureControl(defaultDryRun) {
+      try {
+        await controlDoc().create({
+          dryRun: defaultDryRun,
+          updatedBy: 'agent',
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      } catch {
+        /* already exists (or transient) — leave the operator's value alone */
+      }
+    },
+
+    /** Un-stick jobs orphaned in 'posting' — claimed by an agent that died (or was
+     *  Ctrl+C'd) mid-post before it could write success/fail. Older than staleMs
+     *  ⇒ mark 'failed', NOT 're-queued'. Auto-requeue would double-post any job
+     *  that had actually submitted before the crash (success wasn't recorded, but
+     *  the comment went up). So we surface it as failed and let the operator check
+     *  Reddit and Post again from the UI. Returns the number cleared. */
+    // KIND-AWARE. A warm-up session is capped at 12 minutes by MAX_WALL_SEC, so
+    // one still claimed after ~15 is certainly dead — usually because the agent
+    // was restarted mid-run. Making it wait the POSTING window (20 min, sized for
+    // 4-7 minute replies plus headroom) blocks every further session for that
+    // account with nothing to show for the delay.
+    //
+    // The messages differ too, and that matters: a stranded reply might already
+    // be live on Reddit and must be checked before retrying, while a stranded
+    // browse posted nothing and needs no such care.
+    //
+    // HEARTBEAT FIRST. A job claimed by this version beats every few seconds, so
+    // one silent for `heartbeatStaleMs` (3 min by default) belongs to a process
+    // that is gone — reclaimed in minutes, not after the 15/20-minute claim
+    // windows, which were sized for "how long can a job legitimately take" and
+    // blocked the account for that long after every crash. Jobs claimed by an
+    // older agent have no heartbeat and keep the old kind-aware windows.
+    //
+    // `isRunningHere(id)` excludes this process's own jobs outright: a beat that
+    // failed to write (a network blip) must not get a job this agent is still
+    // driving marked failed by the same agent.
+    async reclaimStalePosting(staleMs, nowMs, warmupStaleMs = staleMs, { heartbeatStaleMs = 3 * 60 * 1000, isRunningHere = () => false } = {}) {
+      const snap = await jobs().where('status', '==', 'posting').limit(50).get();
+      let cleared = 0;
+      for (const d of snap.docs) {
+        if (isRunningHere(d.id)) continue;
+        const isWarmup = d.data().kind === 'warmup';
+        // A karma comment takes the POSTING window and the posting warning: like
+        // a reply and unlike a browse, it may already be live on Reddit.
+        const isComment = d.data().kind === 'comment';
+        const windows = { heartbeatStaleMs, legacyStaleMs: isWarmup ? warmupStaleMs : staleMs };
+        if (isLive(d.data(), nowMs, windows)) continue;
+        const ok = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(d.ref);
+          if (!fresh.exists || fresh.data().status !== 'posting') return false;
+          if (isLive(fresh.data(), nowMs, windows)) return false;
+          tx.update(d.ref, {
+            status: 'failed',
+            error: isWarmup
+              ? 'Agent stopped mid-session — the browse was abandoned. Nothing was posted; just run another when you want one.'
+              : isComment
+                ? 'Agent stopped mid-comment — outcome unknown. Check the account on Reddit before approving another for that thread (it may already be up).'
+                : 'Agent stopped mid-post — outcome unknown. Check Reddit before using Post again (it may already be up).',
+            completedAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+          return true;
+        });
+        if (ok) cleared += 1;
+      }
+      return cleared;
+    },
+
+    /** Heartbeat so the app's Accounts page shows the agent online.
+     *
+     *  `current` is what the agent is doing RIGHT NOW — { jobId, subreddit,
+     *  expectedUsername, startedAtMs, stage } — or null/omitted when idle. The UI
+     *  needs it because `queued` alone cannot distinguish "waiting for an agent"
+     *  from "being worked on this very second", and a humanized job runs for
+     *  minutes. Omitting it deletes the field, so idle is never stale.
+     *
+     *  Called on a TIMER during a job, not just once per poll — see the
+     *  heartbeat ticker in index.mjs. */
+    //
+    // `running` lists EVERY job in flight now that several can be. `current` is
+    // kept as the first of them so a web app from before this change still
+    // renders something true rather than nothing.
+    async heartbeat({ dryRun, queued, postedSession, pid, current, running, slots, agentId, platforms }) {
+      const list = Array.isArray(running) ? running : current ? [current] : [];
+      try {
+        await agentDoc().set(
+          {
+            lastSeenAt: FieldValue.serverTimestamp(),
+            dryRun,
+            queued,
+            postedSession,
+            pid,
+            agentId: agentId ?? null,
+            slots: slots ?? 1,
+            // Which platforms this agent can post to. The web app refuses to
+            // queue a Shopify job unless the live agent lists 'shopify': an
+            // older agent has no platform check and would drive a Shopify job
+            // down the Reddit path.
+            platforms: Array.isArray(platforms) ? platforms : ['reddit'],
+            // Which process wrote `platforms`. The doc is MERGED, and an agent
+            // from before this field never writes it, so the web app only trusts
+            // the list when this matches `pid` — see modules/shopify/posting.ts.
+            platformsPid: pid,
+            running: list,
+            current: list[0] ?? FieldValue.delete(),
+          },
+          { merge: true },
+        );
+      } catch {
+        // non-fatal — a heartbeat failure must never stop posting
+      }
+    },
+
+    /** Keep a running job visibly alive, and say what it is doing.
+     *
+     *  Written to the JOB, not only to agents/agent: the job's heartbeat is what
+     *  its locks are judged by, so it has to live where the claim transaction
+     *  reads. A write that fails is swallowed — see reclaimStalePosting on why a
+     *  missed beat from THIS process can never get the job reclaimed. */
+    async beatJob(ref, stage) {
+      try {
+        await ref.update({
+          heartbeatAt: FieldValue.serverTimestamp(),
+          ...(stage ? { stage: String(stage).slice(0, 120) } : {}),
+        });
+      } catch {
+        /* non-fatal */
+      }
+    },
+
+    /**
+     * Claim the next job that is due AND conflicts with nothing running.
+     *
+     * `keysFor(jobData)` returns the lock keys a job would hold, or null when
+     * they cannot be worked out right now (AdsPower unreachable) — such a job is
+     * not claimed this poll rather than claimed on a guess.
+     *
+     * ⚠️ THE LOCK CHECK AND THE CLAIM ARE ONE TRANSACTION. The transaction reads
+     * the candidate AND every job currently `posting`, and only then marks the
+     * candidate claimed with its keys. Checked outside the transaction, two
+     * claims — two slots in one agent, or two agents — could each see the other's
+     * account as free and both take it. Firestore transactions are serializable,
+     * so a concurrent claim that changes the running set forces a retry.
+     *
+     * Returns { ref, job, keys, queued, blocked } — `blocked` counts due jobs
+     * held back by a lock, so the log can say "2 waiting on a busy account"
+     * rather than looking idle.
+     */
+    async claimNext({ agentId, keysFor, nowMs, heartbeatStaleMs, legacyStaleMs }) {
+      // 200, not 50: the warm-up autopilot queues each account's whole day ahead
+      // with start times, and this read is unordered — with 50, a due job could
+      // sit outside the page behind future ones. Reads cost only what is queued.
+      const snap = await jobs().where('status', '==', 'queued').limit(200).get();
+      if (snap.empty) return { ref: null, job: null, keys: null, queued: 0, blocked: 0, notDue: 0, nextDueMs: null };
+
+      const docs = snap.docs.map((d) => ({ ref: d.ref, id: d.id, data: d.data() }));
+      const due = orderCandidates(docs, nowMs);
+      const notDue = docs.length - due.length;
+      const nextDueMs = nextDueAtMs(docs, nowMs);
+      const windows = { heartbeatStaleMs, legacyStaleMs };
+      let blocked = 0;
+
+      for (const cand of due) {
+        const keys = keysFor(cand.data);
+        if (!keys) {
+          blocked += 1;
+          continue;
+        }
+        const result = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(cand.ref);
+          if (!fresh.exists || fresh.data().status !== 'queued') return { gone: true };
+          const runningSnap = await tx.get(jobs().where('status', '==', 'posting'));
+          const running = runningSnap.docs.map((r) => ({
+            id: r.id,
+            data: r.data(),
+            // A job claimed by an older agent stored no keys; derive what we can
+            // so it still blocks its own account and profile.
+            keys: Array.isArray(r.data().lockKeys) ? r.data().lockKeys : keysFor(r.data()) || [],
+          }));
+          const conflict = findConflict(keys, running, nowMs, windows);
+          if (conflict) return { conflict };
+          tx.update(cand.ref, {
+            status: 'posting',
+            claimedAt: FieldValue.serverTimestamp(),
+            heartbeatAt: FieldValue.serverTimestamp(),
+            claimedBy: agentId,
+            lockKeys: keys,
+            platform: jobPlatform(fresh.data()),
+            stage: 'claimed',
+            attempts: (fresh.data().attempts || 0) + 1,
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+          return { job: fresh.data() };
+        });
+        if (result.job) {
+          return { ref: cand.ref, job: result.job, keys, queued: docs.length - 1, blocked, notDue, nextDueMs };
+        }
+        if (result.conflict) blocked += 1;
+      }
+      return { ref: null, job: null, keys: null, queued: docs.length, blocked, notDue, nextDueMs };
+    },
+
+    /** What the browse lead actually did, written the moment it ends — before
+     *  the approach starts, so a job that later fails still shows it. Never
+     *  allowed to fail the job: it is a record, not a step. */
+    async writeBrowseTrace(ref, browseTrace) {
+      if (!Array.isArray(browseTrace) || !browseTrace.length) return;
+      await ref.update({ browseTrace, updatedAt: FieldValue.serverTimestamp() }).catch(() => {});
+    },
+
+    /** What the first visit did — the look-in before the browse, on a job that
+     *  comes back. Written when it ends, for the same reason as the browse
+     *  trace, and equally unable to fail the job. */
+    async writeFirstVisitTrace(ref, firstVisitTrace) {
+      if (!Array.isArray(firstVisitTrace) || !firstVisitTrace.length) return;
+      await ref.update({ firstVisitTrace, updatedAt: FieldValue.serverTimestamp() }).catch(() => {});
+    },
+
+    /** In a transaction: a job an operator cancelled stays cancelled — a run that
+     *  then breaks must not turn the record into "failed". */
+    async failJob(ref, error, approachTrace) {
+      await db.runTransaction(async (tx) => {
+        const fresh = await tx.get(ref);
+        if (fresh.exists && fresh.data().status === 'cancelled') return;
+        tx.update(ref, {
+          status: 'failed',
+          error: String(error).slice(0, 500),
+          // How far the approach got before it broke — kept alongside the plan so a
+          // failed job shows the intended route AND where reality diverged.
+          ...(Array.isArray(approachTrace) && approachTrace.length ? { approachTrace } : {}),
+          completedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      });
+    },
+
+    /** Put a job back to queued because a SOFT rail said "not yet".
+     *
+     *  `notBeforeMs` (from the gate's `retryAtMs`) makes it wait until the rail
+     *  clears, instead of being claimed, opened, re-checked and put back every
+     *  five seconds. Its locks go with it.
+     *
+     *  In a transaction on `posting`: a job cancelled from the UI between the
+     *  claim and this call must stay cancelled, not be quietly re-queued. */
+    async deferJob(ref, notBeforeMs) {
+      await db.runTransaction(async (tx) => {
+        const fresh = await tx.get(ref);
+        if (!fresh.exists || fresh.data().status !== 'posting') return;
+        tx.update(ref, {
+          status: 'queued',
+          claimedAt: FieldValue.delete(),
+          claimedBy: FieldValue.delete(),
+          heartbeatAt: FieldValue.delete(),
+          lockKeys: FieldValue.delete(),
+          stage: FieldValue.delete(),
+          ...(Number(notBeforeMs) > 0 ? { notBeforeMs: Math.round(Number(notBeforeMs)) } : {}),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      });
+    },
+
+    /** Finish a warm-up session.
+     *
+     *  'completed', NOT 'posted'. A browse posts nothing, and calling it posted
+     *  would put it in the Dashboard's "replies made" counts and lie about what
+     *  the account did. It also advances NO account counters: dailyCap and
+     *  minIntervalMinutes govern submitted comments, and letting a browse consume
+     *  a posting slot would silently throttle real replies.
+     *
+     *  The run record is appended under the ACCOUNT, not the job, because the
+     *  useful question later is "how have this account's sessions been going",
+     *  which is per-account history — the same shape as statSnapshots. */
+    async completeWarmupRun(ref, job, { trace, summary }) {
+      const batch = db.batch();
+      batch.update(ref, {
+        status: 'completed',
+        ...(Array.isArray(trace) && trace.length ? { approachTrace: trace } : {}),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (job.accountId) {
+        // THE EXPERIENCE CLOCK. The ramp reads the LOWER of two clocks: calendar
+        // age, and how many sessions have actually been completed. Age alone let
+        // an account left idle for a week act like a day-8 account having run
+        // three sessions in its life.
+        //
+        // A counter rather than a count() of warmupRuns: the panel's own
+        // subscription is capped at 30 rows, so counting there would silently
+        // under-report past that, and an aggregate query per compose is a read
+        // for a number we can just keep.
+        //
+        // Accounts with runs predating this field start at 0 and are therefore
+        // treated as less experienced than they are. That is the SAFE direction
+        // — an under-counted account is less bold than it earned, never more.
+        // CONFIRMED joins only. `joined` is set from re-reading the button AFTER
+        // the click, so a click that silently failed never reaches this list.
+        // Recording an attempt here would be worse than recording nothing: the
+        // composer skips communities it believes are already joined, so a false
+        // entry means that community is never joined and nothing ever says so.
+        const confirmedJoins = (Array.isArray(trace) ? trace : [])
+          // ...and the ones it found ALREADY joined. That is the same evidence —
+          // the button was read and said Joined — and throwing it away is why a
+          // session could log "already following r/sportsbook" and leave the
+          // Communities tab still asking "already joined?".
+          .filter(
+            (t) =>
+              t &&
+              t.type === 'join_subreddit' &&
+              t.subreddit &&
+              (t.joined === true || (t.skipped === true && t.reason === 'already-joined')),
+          )
+          .map((t) => String(t.subreddit));
+
+        batch.update(accountRef(job.accountId), {
+          warmupSessionsCompleted: FieldValue.increment(1),
+          ...(confirmedJoins.length
+            ? { joinedConfirmed: FieldValue.arrayUnion(...confirmedJoins.map((n) => n.toLowerCase())) }
+            : {}),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        const runRef = accountRef(job.accountId).collection('warmupRuns').doc();
+        batch.set(runRef, {
+          runId: runRef.id,
+          jobId: ref.id,
+          day: job.warmupDay ?? null,
+          plan: Array.isArray(job.warmupPlan) ? job.warmupPlan : [],
+          trace: Array.isArray(trace) ? trace : [],
+          // `summary` carries dryRun from the agent's live switch. Do NOT add a
+          // job.dryRun fallback here — nothing writes that field, so it would
+          // silently record every dry run as a live one.
+          ...summary,
+          ranAt: FieldValue.serverTimestamp(),
+        });
+      }
+      // Cancelled in Engage while the last steps ran: the session never counts,
+      // and the job keeps saying cancelled. The agent stops on the cancel itself;
+      // this closes the gap of a cancel landing between that check and here.
+      if ((await ref.get()).data()?.status === 'cancelled') return;
+      await batch.commit();
+    },
+
+    /** The account's own Communities list, as just read from the sidebar's
+     *  communities section. A SNAPSHOT — it replaces the previous one, so a
+     *  community left by hand drops out. The caller only passes a non-empty read
+     *  of a section it positively identified, so a half-loaded sidebar cannot
+     *  wipe a good list. Kept apart from `joinedConfirmed` (the agent's own
+     *  joins) and `joinedManual` (the operator's): see
+     *  apps/web/src/modules/reddit/joined.ts. */
+    /** The account's RECENT list as the sidebar showed it at the end of a job
+     *  (readRecentCommunities in reddit/shortcuts.mjs). A snapshot, replaced
+     *  each time; an EMPTY list is written too, because "nothing in Recent" is
+     *  a fact a plan must not contradict. `null` — the list was not on the page
+     *  — writes nothing. Never folded into the joined lists: visited is not
+     *  joined. Never allowed to fail the job. */
+    /** Reddit asked this account to prove it is human. Recorded on the account
+     *  as an OPEN check: the agent refuses every job for it, and the web app
+     *  refuses to queue one, until a person marks it solved. Overwrites any
+     *  earlier, solved check — the account page shows the latest. */
+    // ---- AdsPower work queued from Engage (profileTasks) ----
+    //
+    // Proxy tests and profile creation. Not posting jobs: they hold no account
+    // or IP locks and never touch the posting queue. A task's proxy password and
+    // the create body (which carries the comment for the AdsPower remark) are
+    // deleted the moment the task ends, success or not.
+
+    /** Take the oldest queued task, or null. */
+    async claimProfileTask(agentId) {
+      const snap = await db.collection('profileTasks').where('status', '==', 'queued').limit(10).get();
+      const oldest = snap.docs.sort((a, b) => (a.get('createdAt')?.toMillis?.() ?? 0) - (b.get('createdAt')?.toMillis?.() ?? 0));
+      for (const doc of oldest) {
+        const won = await db.runTransaction(async (tx) => {
+          const fresh = await tx.get(doc.ref);
+          if (!fresh.exists || fresh.data().status !== 'queued') return false;
+          tx.update(doc.ref, { status: 'running', claimedBy: agentId, startedAt: FieldValue.serverTimestamp() });
+          return true;
+        });
+        if (won) return { ref: doc.ref, task: doc.data() };
+      }
+      return null;
+    },
+
+    async finishProfileTask(ref, { status, result = null, error = '' }) {
+      await ref.update({
+        status,
+        result,
+        error: String(error).slice(0, 500),
+        proxy: FieldValue.delete(),
+        body: FieldValue.delete(),
+        finishedAt: FieldValue.serverTimestamp(),
+      });
+    },
+
+    /** Anything queued or running — the server must not sleep under it. A
+     *  failed read answers yes, like anyHumanCheckOpen. */
+    async anyProfileTaskPending() {
+      try {
+        const snap = await db.collection('profileTasks').where('status', 'in', ['queued', 'running']).limit(1).get();
+        return !snap.empty;
+      } catch {
+        return true;
+      }
+    },
+
+    async linkCreatedProfile(accountId, profileId) {
+      await accountRef(accountId).update({
+        adsPowerProfileId: profileId,
+        'provisioning.state': 'done',
+        'provisioning.profileId': profileId,
+        'provisioning.error': '',
+        'provisioning.doneAt': FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    },
+
+    async failCreatedProfile(accountId, error) {
+      await accountRef(accountId).update({
+        'provisioning.state': 'failed',
+        'provisioning.error': String(error).slice(0, 500),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    },
+
+    /** Groups and profiles for Engage's form — names and ids only, never a
+     *  proxy login. Written only when something changed. */
+    async publishAdsPowerInventory(inventory) {
+      await db
+        .collection('agents')
+        .doc('adspower')
+        .set({ ...inventory, updatedAt: FieldValue.serverTimestamp() });
+    },
+
+    /** Is any account waiting on a person to solve a "prove you are human" check?
+     *  Its browser is left open on the check, so the server must not sleep. A
+     *  failed read answers yes: not knowing is no reason to close that browser. */
+    async anyHumanCheckOpen() {
+      try {
+        const snap = await db.collection('accounts').where('humanCheck.status', '==', 'open').limit(1).get();
+        return !snap.empty;
+      } catch {
+        return true;
+      }
+    },
+
+    /** Say the server is about to sleep, so Engage shows "asleep" rather than
+     *  "offline" — and clears `running` so nothing reads as in flight. */
+    async markAsleep() {
+      await agentDoc().set(
+        { asleep: true, asleepAt: FieldValue.serverTimestamp(), running: [], current: FieldValue.delete() },
+        { merge: true },
+      );
+    },
+
+    async flagHumanCheck(accountId, { reason, text, url, jobId, kind }) {
+      if (!accountId) return;
+      await accountRef(accountId)
+        .update({
+          humanCheck: {
+            status: 'open',
+            reason,
+            text,
+            url,
+            jobId,
+            kind,
+            detectedAtMs: Date.now(),
+            resolvedAtMs: null,
+            resolvedBy: null,
+            resolvedByName: '',
+          },
+          updatedAt: FieldValue.serverTimestamp(),
+        })
+        .catch(() => {});
+    },
+
+    async writeRecentSnapshot(accountId, subs) {
+      if (!accountId || !Array.isArray(subs)) return;
+      const clean = [...new Set(subs.map((s) => String(s).toLowerCase()).filter(Boolean))].slice(0, 20);
+      await accountRef(accountId)
+        .update({ recentOnReddit: clean, recentOnRedditAt: FieldValue.serverTimestamp() })
+        .catch(() => {});
+    },
+
+    async writeJoinedSnapshot(accountId, subs) {
+      const clean = [...new Set((subs || []).map((s) => String(s).toLowerCase()).filter(Boolean))];
+      if (!clean.length) return;
+      await accountRef(accountId).update({
+        joinedOnReddit: clean,
+        joinedOnRedditAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    },
+
+    /** Persist a Reddit-side stats snapshot captured IN-SESSION (karma,
+     *  subscriptions, account age) on the account's own profile/IP. Writes the
+     *  latest onto the account doc, seeds the frozen baseline on first capture,
+     *  clears any pending refresh request, and appends an immutable history point
+     *  under accounts/{id}/statSnapshots. `snap` is the plain-number AccountStats
+     *  the browser read; `capturedAtMs` is stamped here if absent. Never throws
+     *  into the posting path — the caller wraps it and treats failure as non-fatal. */
+    async writeAccountStats(accountId, snap, nowMs) {
+      const capturedAtMs = snap.capturedAtMs || nowMs;
+      const stats = {
+        linkKarma: Number(snap.linkKarma) || 0,
+        commentKarma: Number(snap.commentKarma) || 0,
+        totalKarma: Number(snap.totalKarma) || 0,
+        subscriptions: Number.isFinite(snap.subscriptions) ? snap.subscriptions : -1,
+        redditCreatedAtMs: Number(snap.redditCreatedAtMs) || 0,
+        capturedAtMs,
+        source: 'agent-session',
+      };
+      const ref = accountRef(accountId);
+      const cur = await ref.get();
+      if (!cur.exists) return;
+      const update = {
+        stats,
+        statsRefreshRequestedAt: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      if (!cur.data().statsBaseline) update.statsBaseline = stats; // freeze first-ever capture
+      await ref.update(update);
+      // Append-only history point (id = capture time for natural ordering).
+      await ref.collection('statSnapshots').doc(String(capturedAtMs)).set({ snapshotId: String(capturedAtMs), ...stats });
+    },
+
+    /** On a real post: job → posted, draft → posted (+ attribution), item →
+     *  drafted, account counters advanced — atomically. */
+    /**
+     * A karma comment went out.
+     *
+     * Advances the COMMENT counters, never the posting ones, and writes the
+     * outcome back onto the draft so the Comment karma tab shows what happened
+     * without needing the job. One batch: a counter advanced without the draft
+     * updated would let the same comment be queued twice.
+     */
+    async completeCommentJob(ref, job, account, permalink, approachTrace) {
+      const nowMs = Date.now();
+      const link = permalink || job.threadUrl;
+      const batch = db.batch();
+      batch.update(ref, {
+        status: 'posted',
+        permalink: link,
+        ...(Array.isArray(approachTrace) && approachTrace.length ? { approachTrace } : {}),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (job.accountId && job.commentDraftId) {
+        batch.update(commentDraftRef(job.accountId, job.commentDraftId), {
+          status: 'posted',
+          permalink: link,
+          // The bot-tell gate reads this as the account's own history, so it has
+          // to be the time the comment actually went up, not the time it was
+          // approved. Length, timing and variety are all measured off it.
+          postedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      if (job.accountId) {
+        batch.update(accountRef(job.accountId), nextCommentCounters(account, nowMs, Timestamp, FieldValue));
+      }
+      await batch.commit();
+    },
+
+    /** Hand a comment draft back — on a failure, or after a dry run.
+     *
+     *  `approved` returns it to the queueable state (a dry run posted nothing,
+     *  so the comment was not spent); `failed` is terminal and carries why. */
+    async releaseCommentDraft(job, status, reason) {
+      if (!job.accountId || !job.commentDraftId) return;
+      try {
+        await commentDraftRef(job.accountId, job.commentDraftId).update({
+          status,
+          jobId: FieldValue.delete(),
+          releaseReason: String(reason || '').slice(0, 500),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      } catch {
+        // Never let bookkeeping mask the real outcome of the job.
+      }
+    },
+
+    /**
+     * A Shopify Community reply went up.
+     *
+     * The draft lives at projects/{pid}/shopifyDrafts/{draftId}, not under
+     * Reddit's drafts, and there is no Reddit item to mark. One batch, for the
+     * reason writeSuccess is one: counters advanced without the draft updated
+     * would let the same reply be queued again.
+     */
+    async writeShopifySuccess(ref, job, account, permalink, approachTrace) {
+      const nowMs = Date.now();
+      const batch = db.batch();
+      batch.update(ref, {
+        status: 'posted',
+        permalink: permalink || job.threadUrl,
+        ...(Array.isArray(approachTrace) && approachTrace.length ? { approachTrace } : {}),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (job.projectId && job.draftId) {
+        batch.update(db.collection('projects').doc(job.projectId).collection('shopifyDrafts').doc(job.draftId), {
+          status: 'posted',
+          postedByAccountId: job.accountId,
+          postedByUsername: job.expectedUsername || '',
+          postedPermalink: permalink || job.threadUrl,
+          postedAtMs: nowMs,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      if (job.accountId) batch.update(accountRef(job.accountId), nextCounters(account, nowMs, Timestamp, FieldValue));
+      await batch.commit();
+    },
+
+    async writeSuccess(ref, job, account, permalink, approachTrace) {
+      const nowMs = Date.now();
+      const link = permalink || job.threadUrl;
+      const batch = db.batch();
+      batch.update(ref, {
+        status: 'posted',
+        permalink: link,
+        // The approach this reply was actually posted through, kept permanently
+        // next to the plan. A posted comment then carries its whole history:
+        // what was intended, and what really happened.
+        ...(Array.isArray(approachTrace) && approachTrace.length ? { approachTrace } : {}),
+        completedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      batch.update(draftRef(job.projectId, job.draftId), {
+        status: 'posted',
+        postedByAccountId: job.accountId,
+        postedPermalink: link,
+        postedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      batch.update(itemRef(job.projectId, job.postId), { processingStatus: 'drafted' });
+      batch.update(accountRef(job.accountId), nextCounters(account, nowMs, Timestamp, FieldValue));
+      await batch.commit();
+    },
+
+    // ========================================================================
+    // The tracking sheet
+    //
+    // Strictly downstream of posting. Every method here is called AFTER the
+    // comment is up and the job says 'posted'; none of them can fail a job.
+    // `sheetStatus` is the whole state machine:
+    //
+    //   off      this project logs to no sheet — there is no row to write
+    //   skipped  this sheet does not carry replies of this kind (see below)
+    //   pending  the comment is up, the row is not in the sheet yet
+    //   writing  a process is appending it right now (claim, with a timestamp)
+    //   written  it is in the sheet
+    //   failed   it was tried SHEET_MAX_ATTEMPTS times; a person must look
+    // ========================================================================
+
+    /**
+     * Take the right to append one row, and the Mention ID it will carry.
+     *
+     * One transaction, because two jobs finishing at the same second must not
+     * be handed the same number: the project's `sheet.nextMention` is read and
+     * advanced here, and the number is written onto the JOB. A retry therefore
+     * reuses the number it was already given rather than burning another —
+     * which is what makes a duplicate row detectable in the sheet instead of
+     * merely likely.
+     *
+     * Returns null when there is nothing to do: no sheet, no payload, already
+     * written, or another process holds a claim that has not gone stale.
+     */
+    async claimSheetRow(ref, nowMs, staleMs) {
+      return db.runTransaction(async (tx) => {
+        const jobSnap = await tx.get(ref);
+        if (!jobSnap.exists) return null;
+        const job = jobSnap.data();
+        const status = job.sheetStatus;
+        if (status !== 'pending' && status !== 'writing') return null;
+        if (job.status !== 'posted') return null;
+        if (!job.sheetRow || !job.projectId) return null;
+        // Somebody else is mid-append and still alive.
+        if (status === 'writing' && nowMs - (job.sheetClaimedAtMs || 0) < staleMs) return null;
+
+        const projRef = db.collection('projects').doc(job.projectId);
+        const projSnap = await tx.get(projRef);
+        const cfg = (projSnap.exists ? projSnap.data().sheet : null) || {};
+        if (cfg.enabled !== true || !cfg.spreadsheetId) {
+          // The sheet was switched off between posting and now. That is an
+          // answer, not a failure: stop sweeping for this row.
+          tx.update(ref, { sheetStatus: 'off' });
+          return null;
+        }
+
+        // Does this sheet carry replies that do not name the client?
+        //
+        // ⚠️ CHECKED HERE, BEFORE A MENTION ID IS CLAIMED. A skipped growth
+        // reply must not burn a number — a client reading RM292-1-14 then
+        // RM292-1-16 would reasonably ask what happened to 15, and the honest
+        // answer would be "a reply you are not allowed to see". Numbers stay
+        // contiguous because the skip happens before the counter moves.
+        //
+        // Read LIVE rather than frozen with the rest of the row: "stop putting
+        // growth replies in the sheet" is a statement about what the sheet is
+        // for, and it should apply to what is already queued. Absent means ON —
+        // the same `!== false` rule as readSheetConfig in the app.
+        if (job.sheetRow.kind === 'growth' && cfg.includeGrowth === false) {
+          tx.update(ref, { sheetStatus: 'skipped', sheetSkipReason: 'growth' });
+          return null;
+        }
+
+        // A number already handed to this job is kept, however the last attempt
+        // ended.
+        const number = Number(job.sheetMentionNumber) || Number(cfg.nextMention) || 1;
+        const isNew = !job.sheetMentionNumber;
+
+        tx.update(ref, {
+          sheetStatus: 'writing',
+          sheetClaimedAtMs: nowMs,
+          sheetMentionNumber: number,
+        });
+        if (isNew) tx.set(projRef, { sheet: { nextMention: number + 1 } }, { merge: true });
+
+        return {
+          projectId: job.projectId,
+          spreadsheetId: String(cfg.spreadsheetId),
+          tabName: String(cfg.tabName || 'Posts'),
+          mentionPrefix: String(cfg.mentionPrefix || ''),
+          number,
+          payload: job.sheetRow,
+          permalink: String(job.permalink || job.threadUrl || ''),
+          postedAtMs: job.completedAt?.toMillis?.() || nowMs,
+          attempts: Number(job.sheetAttempts) || 0,
+          // A row that has been claimed before may already be in the sheet —
+          // the append can succeed and the process die before it is recorded.
+          // The caller checks the Mention ID column first when this is true.
+          retry: !isNew,
+        };
+      });
+    },
+
+    async sheetRowWritten(ref, projectId, nowMs) {
+      await ref.update({ sheetStatus: 'written', sheetWrittenAtMs: nowMs, sheetError: FieldValue.delete() });
+      await db
+        .collection('projects')
+        .doc(projectId)
+        .set({ sheet: { lastWrittenAtMs: nowMs, lastError: null } }, { merge: true });
+    },
+
+    /** Record the failure and either leave it for the next poll or give up. */
+    async sheetRowFailed(ref, projectId, message, attempts, maxAttempts) {
+      const done = attempts >= maxAttempts;
+      await ref.update({
+        sheetStatus: done ? 'failed' : 'pending',
+        sheetAttempts: attempts,
+        sheetError: String(message).slice(0, 400),
+      });
+      await db
+        .collection('projects')
+        .doc(projectId)
+        .set({ sheet: { lastError: String(message).slice(0, 400) } }, { merge: true });
+    },
+
+    /** Posted comments whose row is not in the sheet yet. */
+    async pendingSheetJobs(limit) {
+      const snap = await jobs().where('sheetStatus', 'in', ['pending', 'writing']).limit(limit).get();
+      return snap.docs.map((d) => d.ref);
+    },
+  };
+}

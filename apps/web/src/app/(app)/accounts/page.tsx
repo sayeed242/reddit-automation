@@ -1,0 +1,319 @@
+'use client';
+
+import { useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
+import { Plus, Users, Trash2, X, Flame, ArrowRight } from 'lucide-react';
+import PageHeader from '@/components/PageHeader';
+import AgentControls from '@/components/AgentControls';
+import ActivityList from '@/components/ActivityList';
+import AccountForm, { EMPTY_ACCOUNT_FORM } from '@/components/AccountForm';
+import AccountProfileStatus, { readProvisioning, type Provisioning } from '@/components/AccountProfileStatus';
+import { apiFetch, ApiError } from '@/lib/api';
+import { subscribe, q } from '@/lib/data';
+import { accountPostGate } from '@/modules/reddit/accountGate';
+import { useAuth } from '@/lib/context/AuthContext';
+import type { AccountStats, RedditAccountStatus } from '@/modules/reddit/types';
+import { humanCheckOf } from '@/modules/accounts/humanCheck';
+import { accountPlatform, handleOf, PLATFORM_LABEL, type AccountPlatform } from '@/modules/accounts/platform';
+import { TRUST_LEVEL_LABEL } from '@/modules/shopify/forumUser';
+
+// Posting identities — the Reddit accounts the tool can post FROM.
+//
+// This page is the roster + create surface. Each card links into the account's
+// own page (/accounts/:id) where its Dashboard (karma/subs/activity) and Settings
+// live. No credentials are stored here — the login lives in the account's AdsPower
+// profile; `username` is only the wrong-account safeguard. Reads go straight to
+// Firestore; every write goes through a server route gated on accounts.manage.
+
+const STATUS_BADGE: Record<RedditAccountStatus, string> = {
+  active: 'badge-success',
+  warming: 'badge-warning',
+  flagged: 'badge-warning',
+  banned: 'badge',
+};
+
+interface Account {
+  accountId: string;
+  platform: AccountPlatform;
+  trustLevel: number | null;
+  label: string;
+  username: string;
+  adsPowerProfileId: string;
+  status: RedditAccountStatus;
+  dailyCap: number;
+  minIntervalMinutes: number;
+  karma: number;
+  capturedKarma: number | null;
+  notes: string;
+  postCountToday: number;
+  postCountResetAtMs: number;
+  lastPostAtMs: number;
+  warmupDays: number;
+  /** Reddit asked it to prove it is human and nobody has marked it solved. */
+  humanCheckOpen: boolean;
+  /** Its AdsPower profile being created from Engage, or why that failed. */
+  provisioning: Provisioning;
+  /** An encrypted comment is stored (only the owner can read it). */
+  hasComment: boolean;
+}
+
+const ms = (v: unknown): number =>
+  v && typeof v === 'object' && 'toMillis' in v ? (v as { toMillis(): number }).toMillis() : 0;
+
+export default function AccountsPage() {
+  const { profile } = useAuth();
+  const canManage =
+    profile?.role === 'owner' ||
+    profile?.role === 'admin' ||
+    !!profile?.globalPermissions?.includes('accounts.manage');
+
+  const [raw, setRaw] = useState<Record<string, unknown>[] | null>(null);
+  const [showForm, setShowForm] = useState(false);
+  // Accounts (the roster) or Activity (everything every account did).
+  const [view, setView] = useState<'accounts' | 'activity'>('accounts');
+  // Reddit and Shopify identities share one collection; the tab keeps each
+  // platform's roster — and its platform-specific links — apart.
+  const [platform, setPlatform] = useState<AccountPlatform>('reddit');
+  const [error, setError] = useState<string | null>(null);
+  // Tick so the gate's time-based states (interval, rolling window) re-evaluate.
+  //
+  // Advanced only from callbacks — the tick, or a snapshot — never from the
+  // effect body and never during render, both of which the react-hooks rules
+  // forbid (setState-in-effect cascades a render; Date.now() in render is
+  // impure). Stamping it in the snapshot callback also means `now` is non-zero
+  // by the time there is anything to render, since the cards only appear once
+  // `raw` is set by that same callback. So the gate below never sees 0 — which
+  // matters, because 0 would make every account that has posted read as
+  // "too soon".
+  const [now, setNow] = useState(0);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 10000);
+    const unsub = subscribe<Record<string, unknown>>(
+      q.accounts(),
+      (rows) => {
+        setRaw(rows);
+        setNow(Date.now());
+      },
+      (e) => setError(e.message),
+    );
+    return () => {
+      clearInterval(t);
+      unsub();
+    };
+  }, []);
+
+  const accounts = useMemo<Account[] | null>(() => {
+    if (raw === null) return null;
+    return raw
+      .map((a) => {
+        const stats = a.stats as AccountStats | undefined;
+        return {
+          accountId: a.id as string,
+          platform: accountPlatform(a),
+          trustLevel: ((a.forumStats as { trustLevel?: number | null } | undefined)?.trustLevel ?? null) as number | null,
+          label: (a.label as string) ?? '',
+          username: (a.username as string) ?? '',
+          adsPowerProfileId: (a.adsPowerProfileId as string) ?? '',
+          status: (a.status as RedditAccountStatus) ?? 'warming',
+          dailyCap: (a.dailyCap as number) ?? 0,
+          minIntervalMinutes: (a.minIntervalMinutes as number) ?? 0,
+          karma: (a.karma as number) ?? 0,
+          capturedKarma: stats ? stats.totalKarma : null,
+          notes: (a.notes as string) ?? '',
+          postCountToday: (a.postCountToday as number) ?? 0,
+          postCountResetAtMs: ms(a.postCountResetAt),
+          lastPostAtMs: ms(a.lastPostAt),
+          warmupDays: ((a.warmupPlan as { days?: unknown[] } | undefined)?.days?.length as number) ?? 0,
+          humanCheckOpen: humanCheckOf(a)?.status === 'open',
+          provisioning: readProvisioning(a.provisioning),
+          hasComment: a.hasComment === true,
+        };
+      })
+      .sort((x, y) => x.label.localeCompare(y.label));
+  }, [raw]);
+
+  const shown = (accounts ?? []).filter((a) => a.platform === platform);
+
+  async function remove(a: Account) {
+    if (!confirm(`Delete account "${a.label}"? This does not delete any posted replies.`)) return;
+    setError(null);
+    try {
+      await apiFetch(`/api/accounts/${a.accountId}`, { method: 'DELETE' });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not delete the account.');
+    }
+  }
+
+  return (
+    <>
+      <PageHeader
+        title="Accounts"
+        description="The Reddit and Shopify Community identities the tool can post from. Each posts through an AdsPower profile on a sticky IP. Logins live in the profile; a comment, if added, is stored encrypted and only the owner can read it."
+        action={
+          canManage && !showForm ? (
+            <button className="btn btn-primary btn-sm" onClick={() => setShowForm(true)}>
+              <Plus size={14} /> Add account
+            </button>
+          ) : undefined
+        }
+      />
+
+      <div className="sections">
+        <AgentControls />
+
+        <div className="tabs" style={{ marginBottom: 0 }}>
+          {(
+            [
+              ['accounts', 'Accounts'],
+              ['activity', 'Activity'],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              className={`tab ${view === id ? 'active' : ''}`}
+              onClick={() => setView(id)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer' }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {view === 'activity' && <ActivityList />}
+
+        {view === 'accounts' && (
+          <>
+        {error && !showForm && <p className="text-error small">{error}</p>}
+
+        {showForm && (
+          <section className="card">
+            <div className="card-head">
+              <h3>New account</h3>
+              <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setShowForm(false)} aria-label="Close">
+                <X size={14} />
+              </button>
+            </div>
+            <AccountForm
+              mode="create"
+              initial={{ ...EMPTY_ACCOUNT_FORM, platform }}
+              onDone={() => setShowForm(false)}
+              onCancel={() => setShowForm(false)}
+            />
+          </section>
+        )}
+
+        <div className="tabs-inline">
+          {(['reddit', 'shopify'] as const).map((p) => (
+            <button key={p} className={`chip-tab ${platform === p ? 'active' : ''}`} onClick={() => setPlatform(p)}>
+              {PLATFORM_LABEL[p]}
+              <span className="chip-count">{accounts?.filter((a) => a.platform === p).length ?? 0}</span>
+            </button>
+          ))}
+        </div>
+
+        {accounts === null && <p className="text-dim small">Loading…</p>}
+
+        {accounts && shown.length === 0 && !showForm && (
+          <div className="card">
+            <div className="empty">
+              <Users size={20} className="text-faint" />
+              <p>No {PLATFORM_LABEL[platform]} accounts yet.</p>
+              <p className="text-dim small">
+                {canManage
+                  ? `Add the ${PLATFORM_LABEL[platform]} accounts you'll post replies from.`
+                  : 'No posting identities have been added.'}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {shown.length > 0 && (
+          <div className="account-grid">
+            {shown.map((a) => {
+              const gate = accountPostGate(a, now);
+              return (
+                <article key={a.accountId} className="card">
+                  <div className="card-head">
+                    <div style={{ minWidth: 0 }}>
+                      <Link href={`/accounts/${a.accountId}`} className="strong-link">
+                        {a.label}
+                      </Link>
+                      {a.username && <div className="text-dim small">{handleOf(a.platform, a.username)}</div>}
+                    </div>
+                    <span className={`badge ${STATUS_BADGE[a.status]}`}>{a.status}</span>
+                  </div>
+                  {a.humanCheckOpen && (
+                    <Link href={`/accounts/${a.accountId}`} className="alert alert-error small" style={{ marginBottom: 10, textDecoration: 'none' }}>
+                      Human check — automation stopped until it is solved.
+                    </Link>
+                  )}
+
+                  <div className="row" style={{ flexWrap: 'wrap', gap: 6, margin: '4px 0 12px' }}>
+                    <span className="badge badge-no-dot">
+                      {gate.remainingToday}/{a.dailyCap} left today
+                    </span>
+                    <span className="badge badge-no-dot">{a.minIntervalMinutes}m gap</span>
+                    {a.platform === 'reddit' ? (
+                      <span className="badge badge-no-dot">
+                        {a.capturedKarma !== null ? `${a.capturedKarma.toLocaleString()} karma` : `${a.karma} karma*`}
+                      </span>
+                    ) : (
+                      <span className="badge badge-no-dot">
+                        {a.trustLevel !== null ? `trust ${a.trustLevel} · ${TRUST_LEVEL_LABEL[a.trustLevel] ?? ''}` : 'trust level not read'}
+                      </span>
+                    )}
+                    <span className="badge badge-no-dot">
+                      {a.adsPowerProfileId
+                        ? `profile: ${a.adsPowerProfileId}`
+                        : a.provisioning.state === 'creating'
+                          ? 'profile: creating…'
+                          : 'no profile id'}
+                    </span>
+                  </div>
+
+                  <AccountProfileStatus
+                    accountId={a.accountId}
+                    label={a.label}
+                    hasProfile={!!a.adsPowerProfileId}
+                    hasComment={a.hasComment}
+                    provisioning={a.provisioning}
+                  />
+
+                  {!gate.ok && <p className="text-warning small">{gate.reason}</p>}
+                  {a.lastPostAtMs > 0 && (
+                    <p className="text-faint small">Last post: {new Date(a.lastPostAtMs).toLocaleString()}</p>
+                  )}
+                  {a.notes && <p className="text-muted small clamp">{a.notes}</p>}
+
+                  <div className="row" style={{ marginTop: 12, flexWrap: 'wrap' }}>
+                    <Link href={`/accounts/${a.accountId}`} className="btn btn-primary btn-sm">
+                      Open <ArrowRight size={12} />
+                    </Link>
+                    {a.platform === 'reddit' && (
+                      <Link href={`/accounts/${a.accountId}/warmup`} className="btn btn-secondary btn-sm">
+                        <Flame size={12} /> Warm-up
+                        {a.warmupDays > 0 && (
+                          <span className="badge badge-no-dot badge-success" style={{ marginLeft: 4 }}>
+                            {a.warmupDays}d
+                          </span>
+                        )}
+                      </Link>
+                    )}
+                    {canManage && (
+                      <button className="btn btn-danger btn-sm" onClick={() => remove(a)}>
+                        <Trash2 size={12} /> Delete
+                      </button>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+          </>
+        )}
+      </div>
+    </>
+  );
+}

@@ -1,0 +1,1275 @@
+// Shared low-level primitives for driving NEW reddit (Shreddit) like a human.
+//
+// Layer B/C helpers — used by every interaction primitive (posting AND, later,
+// warm-up). Deliberately small and dependency-free (just the Puppeteer `page`).
+// Keep ALL timing/humanization here so behaviour is consistent across actions.
+
+export const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Fisher-Yates, returning a new array.
+ *
+ *  Used for the ORDER OF RECOVERY when a search route fails. The route the plan
+ *  aimed at is randomised at compose time, but the fallbacks used to run in a
+ *  fixed sequence (typeahead → communities → posts, always), so every recovery
+ *  in the system took the identical path. Recoveries are rare individually and
+ *  perfectly repeatable in aggregate, which is exactly the kind of regularity
+ *  the rest of this design spends effort removing. */
+export const shuffled = (list) => {
+  const out = [...list];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+};
+
+// --- the human pause -----------------------------------------------------
+// ONE knob for "how long does a person hesitate before doing the next thing":
+// between steps, between scroll bursts, before clicking something they spotted.
+// Operator-set range (default 0-13s). Deliberately wide — regular delays are a
+// tell, and the occasional near-zero pause reads as someone already decided.
+//
+// NOT used between individual scroll increments inside a burst: nobody waits 13
+// seconds between two flicks of the wheel. Those stay sub-second (see humanScroll)
+// — a "burst" is one continuous scroll, the pause comes after it.
+// SKEWED, not uniform. A flat 0..max draw sounds human but isn't: it makes the
+// TYPICAL pause a middling ~6.5s (at max=13), because 11-13s is as likely as
+// 0-2s. That both drags — ~21 pauses per run — and is its own kind of regularity.
+// Real hesitation is mostly short, with an occasional genuine distraction.
+// Bands are fractions of the max, so the shape survives retuning the knob:
+//   55% → 0-15%   of max  (0.0-2.0s at 13)  already decided, just acting
+//   30% → 15-46%  of max  (2.0-6.0s)        a beat
+//   15% → 46-100% of max  (6.0-13s)         something caught the eye
+// Mean lands ~3.2s at max=13; the full range is still reachable, just uncommon.
+export const PAUSE_MAX_SEC = Number(process.env.HUMAN_PAUSE_MAX_SEC || 13);
+export function pauseMs() {
+  const max = PAUSE_MAX_SEC * 1000;
+  const r = Math.random();
+  if (r < 0.55) return rand(0, max * 0.15);
+  if (r < 0.85) return rand(max * 0.15, max * 0.46);
+  return rand(max * 0.46, max);
+}
+export const pauseSec = () => pauseMs() / 1000;
+export const humanPause = () => sleep(pauseMs());
+
+/** Apply ± jitterPct to a base value (seconds or ms — unit-agnostic). */
+export function jitter(base, jitterPct) {
+  if (!jitterPct) return base;
+  const delta = base * (jitterPct / 100);
+  return Math.max(0, base + (Math.random() * 2 - 1) * delta);
+}
+
+/** How far down it is still worth scrolling — the bottom of the last comment (or
+ *  the post, on a thread with none), kept a little short of the true page bottom.
+ *
+ *  WHY: Reddit's thread pages carry a few hundred px of empty footer below the
+ *  last comment. Blind pixel scrolling rides straight into it and parks there, so
+ *  every session ends with the viewport sitting in dead space — a tell, and one
+ *  the operator spotted. Returns an absolute scrollY.
+ *
+ *  THREAD PAGES ONLY. Do not apply this to a feed: an infinite feed only loads
+ *  more posts when you approach the bottom of what's rendered, so clamping there
+ *  would stop the hunt from ever reaching new posts. */
+export async function readableScrollLimit(page) {
+  return page
+    .evaluate(() => {
+      const bottomOfLast = (sel) => {
+        const els = document.querySelectorAll(sel);
+        const last = els[els.length - 1];
+        return last ? last.getBoundingClientRect().bottom + window.scrollY : 0;
+      };
+      const contentBottom = bottomOfLast('shreddit-comment') || bottomOfLast('shreddit-post') || document.documentElement.scrollHeight;
+      const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      // Leave the last item ON screen, and never quite touch the page bottom.
+      return Math.max(0, Math.min(contentBottom - window.innerHeight * 0.6, maxScroll - 40));
+    })
+    .catch(() => Number.MAX_SAFE_INTEGER);
+}
+
+// --- scrolling -----------------------------------------------------------
+// HOW THE PAGE MOVES. Every scroll in the agent comes through scrollByBounded.
+//
+// It used to be `window.scrollBy(0, N)`: the page jumped several hundred pixels
+// in one frame, waited, and jumped again — which reads on screen exactly like
+// someone pressing Page Down, and produces a `scroll` event with no `wheel`
+// event behind it. Nothing had moved the page.
+//
+// It now sends real wheel input through the debugging connection, the same
+// channel every click already uses: the in-tab pointer is parked over the main
+// column and a burst of small wheel ticks is dispatched, shaped like the device
+// the profile claims to be. NONE OF THIS TOUCHES THE OPERATING SYSTEM'S CURSOR —
+// these are events delivered to one tab, so the operator's own pointer stays
+// wherever they are working.
+//
+// `SCROLL_MODE=script` in the agent's .env puts the old behaviour back without
+// a code change, and the old scroll is also the automatic fallback whenever a
+// wheel burst fails to move the page (the pointer landed over something that
+// swallowed it). The hunt for a post depends on scrolling actually happening,
+// so a wheel that goes nowhere must never be the end of it.
+const SCROLL_MODE = String(process.env.SCROLL_MODE || 'wheel').toLowerCase();
+
+/**
+ * One scroll gesture, as the ticks a device would send.
+ *
+ * PURE — `rnd` is injected so it can be tested.
+ *
+ *   'trackpad'  a stream of small uneven deltas a few milliseconds apart, fast
+ *               early and tailing off — two fingers and their inertia.
+ *   'notch'     whole wheel clicks of 100px, tens of milliseconds apart, with
+ *               the occasional hesitation — a mouse wheel.
+ *
+ * The two are kept distinct on purpose. Evenly sized, evenly spaced steps match
+ * neither device, and a Mac profile scrolling in 100px notches is its own tell.
+ */
+export function wheelDeltas(dy, style = 'trackpad', rnd = Math.random) {
+  const dist = Math.abs(Math.round(dy));
+  const sign = dy < 0 ? -1 : 1;
+  if (!dist) return [];
+
+  if (style === 'notch') {
+    const n = Math.round(dist / 100);
+    // Less than half a notch: a single short nudge, not a full click past the
+    // limit the caller asked for.
+    if (!n) return [{ deltaY: sign * dist, gapMs: 40 + Math.floor(rnd() * 60) }];
+    return Array.from({ length: n }, () => ({
+      deltaY: sign * 100,
+      gapMs: 45 + Math.floor(rnd() * 95) + (rnd() < 0.12 ? 120 + Math.floor(rnd() * 260) : 0),
+    }));
+  }
+
+  const n = Math.min(48, Math.max(6, Math.round(dist / (16 + rnd() * 18))));
+  // Peaks about a third of the way in and tails off: the push, then the glide.
+  const weights = Array.from({ length: n }, (_, i) => Math.sin(Math.PI * ((i + 0.5) / n) ** 0.7) * (0.8 + rnd() * 0.4) + 0.05);
+  const sum = weights.reduce((x, y) => x + y, 0);
+  const out = [];
+  let left = dist;
+  for (let i = 0; i < n && left > 0; i++) {
+    const d = i === n - 1 ? left : Math.min(left, Math.max(1, Math.round((dist * weights[i]) / sum)));
+    left -= d;
+    out.push({ deltaY: sign * d, gapMs: 7 + Math.floor(rnd() * 14) });
+  }
+  return out;
+}
+
+/** The old scroll: an instant jump from script. Kept as the fallback. */
+async function scriptScrollBounded(page, dy, maxY) {
+  const lim = Number.isFinite(maxY) ? maxY : Number.MAX_SAFE_INTEGER;
+  await page
+    .evaluate(
+      (d, l) => {
+        const target = d > 0 ? Math.min(window.scrollY + d, l) : window.scrollY + d;
+        window.scrollBy(0, target - window.scrollY);
+      },
+      dy,
+      lim
+    )
+    .catch(() => {});
+}
+
+// Where the in-tab pointer rests while scrolling, per page.
+const scrollAnchors = new WeakMap();
+
+/**
+ * Park the in-tab pointer over the main column before wheeling.
+ *
+ * A wheel event goes to whatever is under the pointer, and the pointer is
+ * wherever the last click left it — which may be the header search box or the
+ * left rail, and the rail scrolls on its own. So it is moved back over the
+ * content every time.
+ *
+ * The RIGHT-HAND part of the column, deliberately: a post card's community and
+ * author links sit top-left and open a hover card when the pointer rests on
+ * them, which can then sit on top of the next click.
+ */
+async function hoverMainColumn(page, view) {
+  let a = scrollAnchors.get(page);
+  if (!a || Math.random() < 0.15) {
+    const m = view.main;
+    a = {
+      x: Math.round(m.x + m.w * (0.55 + Math.random() * 0.35)),
+      y: Math.round(view.h * (0.35 + Math.random() * 0.4)),
+    };
+    scrollAnchors.set(page, a);
+  }
+  // A hand resting on a mouse is never perfectly still.
+  const x = Math.min(view.w - 4, Math.max(4, a.x + rand(-6, 7)));
+  const y = Math.min(view.h - 4, Math.max(4, a.y + rand(-6, 7)));
+  await page.mouse.move(x, y, { steps: rand(4, 12) }).catch(() => {});
+}
+
+/** Scroll by `dy`, refusing to go past `maxY` (absolute scrollY). */
+async function scrollByBounded(page, dy, maxY) {
+  if (SCROLL_MODE !== 'wheel') return scriptScrollBounded(page, dy, maxY);
+
+  const view = await page
+    .evaluate(() => {
+      const el = document.querySelector('main') || document.querySelector('shreddit-feed') || document.querySelector('#main-content');
+      const r = el ? el.getBoundingClientRect() : null;
+      const main = r && r.width > 200 ? { x: r.left, w: r.width } : { x: window.innerWidth * 0.2, w: window.innerWidth * 0.5 };
+      const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
+      return {
+        y: window.scrollY,
+        max: Math.max(0, document.documentElement.scrollHeight - window.innerHeight),
+        w: window.innerWidth,
+        h: window.innerHeight,
+        // What the PROFILE says it is, not what this machine is: the gesture has
+        // to match the fingerprint the page already has.
+        mac: /mac/i.test(platform),
+        main,
+      };
+    })
+    .catch(() => null);
+  if (!view) return scriptScrollBounded(page, dy, maxY);
+
+  const lim = Number.isFinite(maxY) ? maxY : Number.MAX_SAFE_INTEGER;
+  const want = dy > 0 ? Math.min(dy, lim - view.y, view.max - view.y) : Math.max(dy, -view.y);
+  if (Math.abs(want) < 8) return;
+
+  try {
+    await hoverMainColumn(page, view);
+    for (const tick of wheelDeltas(want, view.mac ? 'trackpad' : 'notch')) {
+      await page.mouse.wheel({ deltaY: tick.deltaY });
+      await sleep(tick.gapMs);
+    }
+  } catch {
+    return scriptScrollBounded(page, want, maxY);
+  }
+
+  // The browser animates wheel scrolling, so the position lags the last tick.
+  await sleep(rand(180, 320));
+  const after = await page.evaluate(() => window.scrollY).catch(() => null);
+  if (after !== null && Math.abs(after - view.y) < Math.abs(want) * 0.25) {
+    // The wheel went nowhere — the pointer was over something that swallowed
+    // it. Drop the anchor so the next gesture picks a new spot, and make this
+    // one happen the old way.
+    scrollAnchors.delete(page);
+    await scriptScrollBounded(page, want - (after - view.y), maxY);
+  }
+}
+
+/** Dwell for `seconds` (± jitter), with occasional tiny scrolls so the page looks
+ *  alive rather than frozen. Capped by maxSeconds (default 120 = the ≤2min rule).
+ *  Pass maxY (see readableScrollLimit) on thread pages so the drift stops at the
+ *  end of the content instead of bottoming out in the footer. */
+export async function humanDwell(page, seconds, { jitterPct = 25, maxSeconds = 120, maxY = null } = {}) {
+  const total = Math.min(maxSeconds, jitter(seconds, jitterPct)) * 1000;
+  const start = Date.now();
+  while (Date.now() - start < total) {
+    await sleep(rand(1200, 3200));
+    if (Math.random() < 0.6) {
+      await scrollByBounded(page, rand(60, 260), maxY);
+    }
+    // occasionally scroll back up a touch, as a real reader re-reads
+    if (Math.random() < 0.12) {
+      await scrollByBounded(page, -120, maxY);
+    }
+  }
+}
+
+/** Human-ish scroll: a few increments with pauses. Pass maxY on thread pages to
+ *  stop at the end of the readable content (see readableScrollLimit). */
+export async function humanScroll(page, { steps = rand(3, 7), distance = [200, 600], maxY = null } = {}) {
+  for (let i = 0; i < steps; i++) {
+    await scrollByBounded(page, rand(distance[0], distance[1]), maxY);
+    await sleep(rand(500, 1600));
+  }
+}
+
+/** Is this element fixed to the viewport — itself or through an ancestor,
+ *  walking up through shadow hosts? `sticky` counts only while it is actually
+ *  stuck, which for a header means "is at the top of the screen". */
+async function isPinned(handle) {
+  return handle
+    .evaluate((el) => {
+      for (let n = el; n && n !== document.documentElement; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) {
+        if (!(n instanceof Element)) continue;
+        const pos = getComputedStyle(n).position;
+        if (pos === 'fixed') return true;
+        if (pos === 'sticky' && n.getBoundingClientRect().top <= 1) return true;
+      }
+      return false;
+    })
+    .catch(() => false);
+}
+
+/** Is the element already comfortably on screen — clear of the header at the
+ *  top and of the bottom edge? Then a person just clicks it. */
+async function isInView(handle) {
+  return handle
+    .evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return r.height > 0 && r.top >= 80 && r.bottom <= window.innerHeight - 40;
+    })
+    .catch(() => false);
+}
+
+/** Scroll an element into view the way a person does — in a few paced increments
+ *  rather than the instant jump scrollIntoView() gives. Anything more than a few
+ *  screens away gets one jump to close the distance first (nobody hand-scrolls
+ *  7000px), then settles gradually. Used by every human click. */
+export async function humanScrollToElement(page, handle, { target = 0.45, tolerance = 120 } = {}) {
+  const delta = async () =>
+    handle
+      .evaluate((el, frac) => {
+        const r = el.getBoundingClientRect();
+        return r.top - window.innerHeight * frac;
+      }, target)
+      .catch(() => 0);
+
+  // PINNED TO THE SCREEN — the search box, anything in the header. Scrolling
+  // cannot move it, so trying to bring it to mid-screen only drags the page
+  // back to the top, which is what a search after a few scrolls of the feed
+  // used to do: scroll all the way up, then use a search box that had been on
+  // screen the whole time.
+  if (await isPinned(handle)) return;
+
+  let d = await delta();
+  if (Math.abs(d) > 2400) {
+    await handle.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+    await sleep(rand(300, 700));
+    d = await delta();
+  }
+  for (let i = 0; i < 10 && Math.abs(d) > tolerance; i++) {
+    const stepPx = Math.sign(d) * Math.min(Math.abs(d), rand(180, 520));
+    await scrollByBounded(page, stepPx, null);
+    await sleep(rand(220, 620));
+    const next = await delta();
+    // The page moved and the element did not: it is pinned after all (a sticky
+    // bar the check above could not see). Stop rather than scroll to the end.
+    if (Math.abs(next - d) < 2) break;
+    d = next;
+  }
+}
+
+/**
+ * Bring an element into view inside a SIDE PANEL that scrolls by itself.
+ *
+ * The left navigation and the right-hand column on new Reddit are each pinned
+ * to the screen and scroll independently of the page (read off a live page
+ * 2026-10-13: the nav is 762px tall on an 819px screen and its Recent list
+ * starts at 747px — below its own fold, whatever the page is doing). So
+ * humanScrollToElement cannot reach anything in them: it sees a pinned element
+ * and, correctly, leaves the page alone.
+ *
+ * A person puts the pointer over the panel and scrolls THAT. Same here: the
+ * pointer moves onto the panel, and the wheel does the rest — whichever element
+ * is the real scroller receives it, so this never needs to know.
+ *
+ * `paneSelectors` name the panel (matched on an ancestor, through shadow hosts).
+ * Returns whether the element ended up on screen.
+ */
+export async function humanScrollPaneTo(page, handle, paneSelectors) {
+  const measure = () =>
+    handle
+      .evaluate((el, sels) => {
+        const r = el.getBoundingClientRect();
+        let pane = null;
+        for (let n = el; n; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) {
+          if (n.matches && sels.some((s) => n.matches(s))) {
+            pane = n;
+            break;
+          }
+        }
+        const pr = pane ? pane.getBoundingClientRect() : null;
+        const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
+        // The part of the panel that is actually on screen.
+        const lo = Math.max(72, pr ? pr.top : 0) + 8;
+        const hi = Math.min(window.innerHeight, pr ? pr.bottom : window.innerHeight) - 24;
+        return {
+          top: r.top,
+          bottom: r.bottom,
+          h: r.height,
+          lo,
+          hi,
+          x: pr && pr.width > 40 ? pr.left + pr.width * (0.3 + Math.random() * 0.4) : r.left + r.width / 2,
+          mac: /mac/i.test(platform),
+        };
+      }, paneSelectors)
+      .catch(() => null);
+  const inView = (m) => !!m && m.h > 0 && m.top >= m.lo && m.bottom <= m.hi;
+
+  let m = await measure();
+  for (let i = 0; i < 8 && m && m.h > 0 && !inView(m); i++) {
+    const want = (m.top + m.bottom) / 2 - (m.lo + m.hi) / 2;
+    const dy = Math.sign(want) * Math.min(Math.abs(want), rand(160, 420));
+    await page.mouse.move(m.x + rand(-6, 7), (m.lo + m.hi) / 2 + rand(-60, 60), { steps: rand(5, 14) }).catch(() => {});
+    await sleep(rand(120, 380));
+    for (const tick of wheelDeltas(dy, m.mac ? 'trackpad' : 'notch')) {
+      await page.mouse.wheel({ deltaY: tick.deltaY }).catch(() => {});
+      await sleep(tick.gapMs);
+    }
+    await sleep(rand(260, 620));
+    const next = await measure();
+    // The wheel went nowhere: the pointer was not over the thing that scrolls.
+    if (!next || Math.abs(next.top - m.top) < 2) break;
+    m = next;
+  }
+  if (inView(m)) return true;
+
+  await handle.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+  await sleep(rand(300, 700));
+  return inView(await measure());
+}
+
+/** Type into the currently-focused element, human-paced.
+ *
+ *  Newlines are NOT typed as characters: in a rich (Lexical) editor a blank line
+ *  between paragraphs is one Enter (new block), and a single newline inside a
+ *  paragraph is Shift+Enter (soft break). Typing "\n\n" literally would leave an
+ *  extra empty paragraph. */
+export async function humanTypeFocused(page, text) {
+  const paragraphs = String(text).split(/\n{2,}/);
+  for (let p = 0; p < paragraphs.length; p++) {
+    if (p > 0) {
+      await page.keyboard.press('Enter');
+      await sleep(rand(200, 500));
+    }
+    const lines = paragraphs[p].split('\n');
+    for (let l = 0; l < lines.length; l++) {
+      if (l > 0) {
+        await page.keyboard.down('Shift');
+        await page.keyboard.press('Enter');
+        await page.keyboard.up('Shift');
+        await sleep(rand(120, 300));
+      }
+      for (const ch of lines[l]) {
+        await page.keyboard.type(ch, { delay: rand(35, 110) });
+        if (Math.random() < 0.04) await sleep(rand(250, 800)); // occasional think pause
+      }
+    }
+  }
+}
+
+/** Exact, drop-free insertion into the focused editor via CDP `Input.insertText`
+ *  (Lexical-safe — it arrives as a real beforeinput/insertText). Used as the
+ *  REPAIR path when human typing lost characters, never as the default (it isn't
+ *  keystroke-shaped). Paragraph breaks are still real Enter presses. */
+export async function insertTextFocused(page, text) {
+  const cdp = await page.target().createCDPSession();
+  try {
+    const paragraphs = String(text).split(/\n{2,}/);
+    for (let p = 0; p < paragraphs.length; p++) {
+      if (p > 0) {
+        await page.keyboard.press('Enter');
+        await sleep(rand(120, 260));
+      }
+      const lines = paragraphs[p].split('\n');
+      for (let l = 0; l < lines.length; l++) {
+        if (l > 0) {
+          await page.keyboard.down('Shift');
+          await page.keyboard.press('Enter');
+          await page.keyboard.up('Shift');
+          await sleep(rand(80, 180));
+        }
+        if (lines[l]) await cdp.send('Input.insertText', { text: lines[l] });
+      }
+    }
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+/** Empty an editor we're about to type into. Cmd/Ctrl+A over CDP is unreliable on
+ *  macOS (the browser edit command never fires), so select the content with the
+ *  Selection API (or setSelectionRange for a textarea) and let a real Backspace
+ *  do the deletion — that path Lexical handles correctly. */
+export async function clearEditor(page, handle) {
+  await handle
+    .evaluate((el) => {
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        el.focus();
+        el.setSelectionRange(0, el.value.length);
+        return;
+      }
+      el.focus();
+      const sel = (el.getRootNode().getSelection ? el.getRootNode() : window).getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    })
+    .catch(() => {});
+  await sleep(rand(120, 280));
+  await page.keyboard.press('Backspace');
+  await sleep(rand(150, 350));
+}
+
+/** Wait for an element that may live inside OPEN shadow roots. Puppeteer pierces
+ *  open shadow DOM with the `>>>` deep combinator in $/waitForSelector. Returns
+ *  the handle, or null on timeout. Closed roots won't match — callers fall back. */
+export async function waitForDeep(page, selector, timeout = 15000) {
+  try {
+    return await page.waitForSelector(selector, { visible: true, timeout });
+  } catch {
+    return null;
+  }
+}
+
+/** First matching handle across the given deep selectors, or null. */
+export async function queryFirst(page, selectors) {
+  for (const sel of selectors) {
+    const h = await page.$(sel).catch(() => null);
+    if (h) return h;
+  }
+  return null;
+}
+
+/** Find an element by BFS-walking ALL open shadow roots from document down,
+ *  returning the first match for any of `selectors` as an ElementHandle (or null).
+ *  Robust for Shreddit's faceplate web components (e.g. the comment <textarea> is
+ *  nested inside open shadow roots). Only OPEN roots are traversable — a closed
+ *  root would need a CDP fallback, but the composer's root is open (verified live).
+ *
+ *  VISIBILITY MATTERS, and is the default. Shreddit renders DUPLICATE, never-laid-out
+ *  copies of components (the thread page carries a second, 0x0 "Join the conversation"
+ *  textarea under a stray faceplate-tracker chain). A plain first-match BFS returns
+ *  that decoy, and every downstream geometry call then fails — this is exactly what
+ *  wedged the composer. Pass { visibleOnly: false } only when a hidden match is fine. */
+export async function deepQueryHandle(page, selectors, { visibleOnly = true } = {}) {
+  const handle = await page.evaluateHandle(
+    (sels, mustBeVisible) => {
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 4 || r.height <= 4) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== 'hidden' && cs.display !== 'none' && Number(cs.opacity) > 0.05;
+      };
+      const queue = [document];
+      const seen = new Set();
+      while (queue.length) {
+        const root = queue.shift();
+        for (const sel of sels) {
+          for (const el of root.querySelectorAll(sel)) {
+            if (!mustBeVisible || isVisible(el)) return el;
+          }
+        }
+        for (const node of root.querySelectorAll('*')) {
+          if (node.shadowRoot && !seen.has(node.shadowRoot)) {
+            seen.add(node.shadowRoot);
+            queue.push(node.shadowRoot);
+          }
+        }
+      }
+      return null;
+    },
+    selectors,
+    visibleOnly
+  );
+  const el = handle.asElement();
+  if (!el) {
+    await handle.dispose().catch(() => {});
+    return null;
+  }
+  return el;
+}
+
+/** deepQueryHandle scoped to ONE element's subtree (including its open shadow
+ *  roots). Needed whenever "the button belonging to THIS thing" matters — e.g.
+ *  the upvote button of a specific comment, where a page-wide query would happily
+ *  return some other comment's. */
+export async function deepQueryWithin(handle, selectors, { visibleOnly = true } = {}) {
+  const found = await handle.evaluateHandle(
+    (host, sels, mustBeVisible) => {
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 4 || r.height <= 4) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== 'hidden' && cs.display !== 'none' && Number(cs.opacity) > 0.05;
+      };
+      // Seed with the host AND its own shadow root: Element.querySelectorAll only
+      // searches light descendants, so a host whose button lives in its OWN shadow
+      // root (exactly how shreddit-post holds its vote buttons) would be missed.
+      const queue = [host];
+      const seen = new Set();
+      if (host.shadowRoot) {
+        seen.add(host.shadowRoot);
+        queue.push(host.shadowRoot);
+      }
+      while (queue.length) {
+        const root = queue.shift();
+        for (const sel of sels) {
+          for (const el of root.querySelectorAll(sel)) {
+            if (!mustBeVisible || isVisible(el)) return el;
+          }
+        }
+        for (const node of root.querySelectorAll('*')) {
+          if (node.shadowRoot && !seen.has(node.shadowRoot)) {
+            seen.add(node.shadowRoot);
+            queue.push(node.shadowRoot);
+          }
+        }
+      }
+      return null;
+    },
+    selectors,
+    visibleOnly
+  );
+  const el = found.asElement();
+  if (!el) {
+    await found.dispose().catch(() => {});
+    return null;
+  }
+  return el;
+}
+
+/**
+ * The link to ONE named community, matched case-INSENSITIVELY.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * WHY THIS IS NOT A CSS SELECTOR ANY MORE.
+ *
+ * Both search paths used to look the community up with an exact attribute match:
+ *
+ *     `a[href="/r/${sub}/"]`                                          // WRONG
+ *
+ * CSS attribute selectors compare values CASE-SENSITIVELY — `href` is not one of
+ * the attributes HTML folds — while normalizeSubredditName() lowercases every
+ * name we store. Reddit's markup carries the community's canonical display
+ * casing. So for r/MiddleClassFinance the page holds `/r/MiddleClassFinance/`,
+ * we searched for `/r/middleclassfinance/`, and the selector could not match on
+ * ANY surface: not the typeahead, not the Communities tab, not the posts
+ * results. All three routes failed and the step fell through to a direct visit.
+ *
+ * Seen live 2026-08-15: 121 seconds burned on three doomed routes, then
+ * `search_subreddit: no search route landed — falling back to a direct visit`,
+ * on a community that was plainly visible in all three surfaces. The tell was
+ * in the history all along — every community ever reached through a search route
+ * (passive_income, howearnmoneyonline) is all-lowercase, and the mixed-case ones
+ * (NatureAwws) were only ever reached by open_post_subreddit, which prefix-
+ * matches `/r/` and never touches the name.
+ *
+ * The cost was not just time. A discovery leg that degrades to openSubreddit
+ * types the community's URL — the exact teleport footprint the warm-up design
+ * exists to eliminate — while the plan and the trace both still say "via the
+ * header search".
+ *
+ * WHAT IS DELIBERATELY *NOT* WIDENED. The name is still compared as a WHOLE
+ * SEGMENT, so a results page for "personalfinance" cannot land on
+ * r/UKPersonalFinance — that guarantee was the reason for the exact match and it
+ * is preserved intact. Only the casing folds. The path must also be the
+ * community ROOT (`/r/<name>` or `/r/<name>/`) and never a permalink beneath it,
+ * or route 3 would click a post from the community instead of the community
+ * itself and land on a thread while the composer believed it was on a feed.
+ * Query strings and fragments are ignored: community identity lives entirely in
+ * the path, so a tracking param cannot change which community a click reaches.
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+export async function deepQueryCommunityLink(page, subreddit, { visibleOnly = true, within = null } = {}) {
+  const handle = await page.evaluateHandle(
+    (wantedRaw, mustBeVisible, scopes) => {
+      const wanted = String(wantedRaw || '').toLowerCase();
+      if (!wanted) return null;
+      // `within` confines the match to one surface: the anchor must have an
+      // ancestor matching one of these selectors, walking up through shadow
+      // hosts. Without it the WHOLE page is searched — right for following a
+      // post to its community, and wrong for search, where the page behind an
+      // open suggestion list is full of community links that are not
+      // suggestions. See reddit/search.mjs.
+      const inScope = (a) => {
+        if (!scopes || !scopes.length) return true;
+        for (let n = a; n; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) {
+          if (n.matches && scopes.some((sel) => n.matches(sel))) return true;
+        }
+        return false;
+      };
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 4 || r.height <= 4) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== 'hidden' && cs.display !== 'none' && Number(cs.opacity) > 0.05;
+      };
+      /** Is this anchor the ROOT of the community we want? */
+      const isTarget = (a) => {
+        const raw = a.getAttribute('href');
+        if (!raw) return false;
+        let path;
+        try {
+          // Resolves relative and absolute alike, and drops ?query / #hash.
+          path = new URL(raw, location.origin).pathname;
+        } catch {
+          return false;
+        }
+        const parts = path.split('/').filter(Boolean);
+        // Exactly ['r', '<name>'] — never a permalink below the community.
+        return parts.length === 2 && parts[0].toLowerCase() === 'r' && parts[1].toLowerCase() === wanted;
+      };
+      /** Does this href carry a filter? `/r/ynab/?f=flair_name:"New to YNAB"` is
+       *  a link to the RIGHT community showing a NARROWED feed. Still the right
+       *  place, so it is an acceptable last resort — but a plain link to the
+       *  community is strictly better, and on a post page the flair link is
+       *  often the first one in document order. Preferred, not required. */
+      const isFiltered = (a) => {
+        try {
+          return !!new URL(a.getAttribute('href'), location.origin).search;
+        } catch {
+          return true;
+        }
+      };
+
+      let fallback = null;
+      const queue = [document];
+      const seen = new Set();
+      while (queue.length) {
+        const root = queue.shift();
+        for (const a of root.querySelectorAll('a[href]')) {
+          if (!isTarget(a) || (mustBeVisible && !isVisible(a)) || !inScope(a)) continue;
+          if (!isFiltered(a)) return a;
+          if (!fallback) fallback = a;
+        }
+        for (const node of root.querySelectorAll('*')) {
+          if (node.shadowRoot && !seen.has(node.shadowRoot)) {
+            seen.add(node.shadowRoot);
+            queue.push(node.shadowRoot);
+          }
+        }
+      }
+      return fallback;
+    },
+    subreddit,
+    visibleOnly,
+    within
+  );
+  const el = handle.asElement();
+  if (!el) {
+    await handle.dispose().catch(() => {});
+    return null;
+  }
+  return el;
+}
+
+/** deepQueryCommunityLink, polled — the search surfaces populate asynchronously,
+ *  exactly like the components waitForDeepVisible exists for. */
+export async function waitForCommunityLink(page, subreddit, timeoutMs = 8000, opts = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const h = await deepQueryCommunityLink(page, subreddit, opts);
+    if (h) return h;
+    if (Date.now() > deadline) return null;
+    await sleep(350);
+  }
+}
+
+/** deepQueryHandle, but poll until something VISIBLE shows up (or timeout → null).
+ *  Needed because Shreddit swaps components in on interaction (the rich editor only
+ *  gets a layout box after the collapsed box is clicked). */
+export async function waitForDeepVisible(page, selectors, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const h = await deepQueryHandle(page, selectors);
+    if (h) return h;
+    if (Date.now() > deadline) return null;
+    await sleep(350);
+  }
+}
+
+/** Viewport-relative rect measured IN PAGE. Use this instead of Puppeteer's
+ *  boundingBox(): CDP's box model returns null for slotted / shadow-hosted /
+ *  zero-layout nodes, which is how the composer click loop ended up with
+ *  "no usable boundingBox (null)" on every attempt. */
+export async function elementRect(handle) {
+  return handle
+    .evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, w: r.width, h: r.height };
+    })
+    .catch(() => null);
+}
+
+/** Click an element the way a person would: scroll it into view, then dispatch a
+ *  real mouse move + click at viewport coordinates inside its rect. Returns
+ *  { ok, rect, hit, x, y } — `hit` is what actually sits at that pixel (an overlay
+ *  eating the click shows up here). */
+/** Is something else on top of this element at its centre? Pierces shadow
+ *  roots on both sides, so a link inside a web component is not "covered" by
+ *  its own host. */
+async function isCovered(handle) {
+  return handle
+    .evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 4 || r.height <= 4) return false;
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return false;
+      let top = document.elementFromPoint(x, y);
+      for (let i = 0; i < 12 && top && top.shadowRoot; i++) {
+        const inner = top.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === top) break;
+        top = inner;
+      }
+      if (!top) return false;
+      // Covered unless what is on top IS the element, is inside it, or contains
+      // it (a label wrapping its own text).
+      for (let n = top; n; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) if (n === el) return false;
+      for (let n = el; n; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) if (n === top) return false;
+      return true;
+    })
+    .catch(() => false);
+}
+
+/** Where the click guard reports a popup it closed. Set by the executor. */
+let clickLog = () => {};
+export function setClickLog(fn) {
+  clickLog = typeof fn === 'function' ? fn : () => {};
+}
+
+export async function humanClickHandle(page, handle, { padX = [24, 60], padY = [8, 20], scroll = true, guard = true } = {}) {
+  // `scroll: false` for a target inside an overlay that is already on screen —
+  // a suggestion in the open search list. Scrolling there moves the page BEHIND
+  // the overlay and nothing else.
+  // And not when it is already on screen: nobody scrolls to line up something
+  // they can see before clicking it. (Reading steps call humanScrollToElement
+  // directly and keep their positioning — this is only the click path.)
+  if (scroll && !(await isInView(handle))) await humanScrollToElement(page, handle);
+  await sleep(rand(350, 750));
+  // Something covering the target — a popup that arrived after the step began
+  // — would take this click instead. Close it first, then aim again.
+  if (guard && (await isCovered(handle))) await dismissBlockingOverlay(page, clickLog);
+  const r = await elementRect(handle);
+  if (!r || r.w <= 4 || r.h <= 4) return { ok: false, rect: r, hit: '' };
+  const x = r.x + Math.min(rand(padX[0], padX[1]), r.w * 0.45);
+  const y = r.y + Math.min(rand(padY[0], padY[1]), r.h * 0.6);
+  const hit = await page
+    .evaluate(
+      ({ px, py }) => {
+        const el = document.elementFromPoint(px, py);
+        return el ? el.tagName.toLowerCase() + (el.id ? `#${el.id}` : '') : 'none';
+      },
+      { px: x, py: y }
+    )
+    .catch(() => '?');
+  await page.mouse.move(x, y).catch(() => {});
+  await sleep(rand(60, 160));
+  await page.mouse.click(x, y, { delay: rand(45, 110) }).catch(() => {});
+  return { ok: true, rect: r, hit, x, y };
+}
+
+// --- popups that cover the page ---------------------------------------------
+// Reddit sometimes puts a dialog over everything: a community's welcome guide
+// after joining ("Welcome to r/AskReddit … Got It"), a new-achievement card, a
+// prompt of some other kind. The agent could not see it. It went on scrolling
+// and clicking the page BEHIND the dialog — where nothing responds — for the
+// rest of the session.
+//
+// WRITTEN WITHOUT THE MARKUP. Those dialogs come and go and none was on screen
+// to read, so this recognises one by what it IS, not by what it is called:
+//
+//   whatever sits at the CENTRE of the screen belongs to something pinned to
+//   the viewport (or a <dialog> / role=dialog / aria-modal) that takes up a
+//   real share of it.
+//
+// The header, the sidebars and the chat window are pinned too, but none of them
+// is at the centre of the screen. The search suggestions are not either.
+//
+// It is then closed the way a person closes it: the button that says so. Only a
+// SHORT LIST of plainly dismissive labels is ever clicked — never "Join",
+// "Accept", "Continue" or anything else that would DO something on the account.
+// No such button: press Escape. Every dialog met is logged with its structure
+// and its buttons, so the next one that this does not handle can be read from
+// the log instead of guessed at.
+export const DISMISS_LABELS = ['got it', 'ok', 'okay', 'close', 'dismiss', 'done', 'maybe later', 'not now', 'no thanks', 'skip'];
+
+/** In-page: the blocking dialog, or null. Returned as plain data plus (via the
+ *  handle variant) the element to click. Kept as ONE function so both callers
+ *  agree on what a dialog is. */
+export function findBlockingOverlayInPage(labels, wantButton) {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const big = (r) => r.width >= vw * 0.2 && r.height >= vh * 0.2;
+  const shown = (n) => {
+    const cs = getComputedStyle(n);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) > 0.05;
+  };
+  const up = (n) => n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+  const isDeclared = (n) => {
+    const tag = n.tagName.toLowerCase();
+    return tag === 'dialog' || n.getAttribute('role') === 'dialog' || n.getAttribute('role') === 'alertdialog' || n.getAttribute('aria-modal') === 'true';
+  };
+
+  // 1. Whatever is at the centre of the screen, piercing shadow roots, and the
+  //    outermost pinned or declared dialog it sits in.
+  const cx = vw / 2;
+  const cy = vh / 2;
+  let el = document.elementFromPoint(cx, cy);
+  for (let i = 0; i < 12 && el && el.shadowRoot; i++) {
+    const inner = el.shadowRoot.elementFromPoint(cx, cy);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+  let dialog = null;
+  for (let n = el; n && n !== document.documentElement && n !== document.body; n = up(n)) {
+    if (!(n instanceof Element)) continue;
+    if (!isDeclared(n) && getComputedStyle(n).position !== 'fixed') continue;
+    // A real share of the screen. A pinned toast or a small badge is not it.
+    if (big(n.getBoundingClientRect())) dialog = n; // keep the OUTERMOST
+  }
+
+  // 2. Not at the centre — or the centre hit only a backdrop with nothing to
+  //    press — so look everywhere for an OPEN modal that takes up real room:
+  //    an open <dialog>, or anything declaring itself a dialog. Reddit keeps a
+  //    dozen zero-size "dialogs" (hovercards, tooltips) in every page; the size
+  //    and visibility checks are what rule those out. Added 2026-10-19 after a
+  //    community's welcome card ("Welcome to our subreddit … Got It") sat over
+  //    r/SEO for the rest of a session without being seen.
+  if (!dialog || !dialog.querySelector('button, [role="button"]')) {
+    const queue = [document];
+    let found = null;
+    while (queue.length && !found) {
+      const root = queue.shift();
+      for (const n of root.querySelectorAll('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]')) {
+        if (n.tagName === 'DIALOG' && !n.open) continue;
+        // A hovercard or tooltip opens under the pointer and closes by itself.
+        if (n.id === 'hovercard' || n.id === 'faceplate-tooltip') continue;
+        if (!shown(n) || !big(n.getBoundingClientRect())) continue;
+        found = n;
+        break;
+      }
+      for (const n of root.querySelectorAll('*')) if (n.shadowRoot) queue.push(n.shadowRoot);
+    }
+    if (found) dialog = found;
+  }
+  if (!dialog) return null;
+
+  const buttons = [];
+  const collect = (root, depth) => {
+    for (const b of root.querySelectorAll('button, [role="button"]')) {
+      const r = b.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      const text = (b.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
+      const aria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+      buttons.push({ b, text, aria });
+    }
+    for (const e of root.querySelectorAll('*')) if (e.shadowRoot && depth < 6) collect(e.shadowRoot, depth + 1);
+  };
+  collect(dialog, 0);
+  if (dialog.shadowRoot) collect(dialog.shadowRoot, 0);
+
+  const pick =
+    buttons.find((x) => labels.includes(x.text)) ||
+    buttons.find((x) => labels.includes(x.aria)) ||
+    buttons.find((x) => /^close\b/.test(x.aria)) ||
+    null;
+  if (wantButton) return pick ? pick.b : null;
+
+  const chain = [];
+  for (let n = dialog, i = 0; n && i < 6; i++, n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) {
+    if (n instanceof Element) chain.push(n.tagName.toLowerCase() + (n.id ? `#${n.id}` : ''));
+  }
+  return {
+    what: chain.join(' < '),
+    title: (dialog.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+    buttons: [...new Set(buttons.map((x) => x.text || x.aria).filter(Boolean))].slice(0, 8),
+    dismissWith: pick ? pick.text || pick.aria : '',
+  };
+}
+
+/**
+ * Close a dialog that is covering the page, if there is one.
+ *
+ * Never throws and never blocks a step: anything that goes wrong here leaves
+ * the page as it was. Returns { found, dismissed }.
+ */
+export async function dismissBlockingOverlay(page, log = () => {}) {
+  try {
+    const info = await page.evaluate(findBlockingOverlayInPage, DISMISS_LABELS, false);
+    if (!info) return { found: false, dismissed: false };
+    // A "prove you are human" check is NOT a popup to close. See below.
+    const check = await detectHumanCheck(page);
+    if (check) throw new HumanCheckError(check);
+    log(`popup: something is covering the page — ${info.what} · "${info.title}" · buttons: ${info.buttons.join(', ') || 'none'}`);
+
+    await sleep(rand(900, 2400)); // reading it
+    if (info.dismissWith) {
+      const handle = await page.evaluateHandle(findBlockingOverlayInPage, DISMISS_LABELS, true);
+      const btn = handle.asElement();
+      if (btn) {
+        // Already on screen, and inside a pinned dialog: no scrolling.
+        await humanClickHandle(page, btn, { padX: [14, 60], padY: [6, 16], scroll: false, guard: false });
+        await sleep(rand(700, 1500));
+      }
+    } else {
+      await page.keyboard.press('Escape');
+      await sleep(rand(700, 1500));
+    }
+
+    let still = await page.evaluate(findBlockingOverlayInPage, DISMISS_LABELS, false).catch(() => null);
+    if (still && info.dismissWith) {
+      // The button did not close it. Escape is what a person tries next.
+      await page.keyboard.press('Escape');
+      await sleep(rand(700, 1500));
+      still = await page.evaluate(findBlockingOverlayInPage, DISMISS_LABELS, false).catch(() => null);
+    }
+    if (still) {
+      log('popup: it is still there — carrying on, but this step may not see the page.');
+      return { found: true, dismissed: false };
+    }
+    log(`popup: closed it (${info.dismissWith ? `"${info.dismissWith}"` : 'Escape'}).`);
+    return { found: true, dismissed: true };
+  } catch (e) {
+    if (e && e.humanCheck) throw e;
+    return { found: false, dismissed: false };
+  }
+}
+
+// --- "prove you are human" ----------------------------------------------------
+// Reddit (or the network in front of it) sometimes asks the browser to prove a
+// person is there: a CAPTCHA, a Cloudflare check, a "verify you are human"
+// page or dialog. The agent must NEVER try to get past one. It stops the job on
+// the spot, leaves the browser open on the check, and flags the account so no
+// other job runs from it until a person has dealt with it and said so.
+//
+// Recognised by what such checks are built from, not by one site's markup:
+// the challenge frames of the common providers, a challenge URL, or a heading
+// in a dialog or on the page that asks to prove you are human. Deliberately
+// narrow on the wording side — a post TITLED "how do I prove I'm human" in a
+// feed is not a check, so text only counts inside a dialog, a heading, or a
+// page that is mostly that text.
+
+export class HumanCheckError extends Error {
+  constructor(info) {
+    super(`HUMAN CHECK — Reddit asked this account to prove it is human (${info.reason}). The job was stopped and the browser left open on it. Solve it by hand, then mark it solved on the account's page.`);
+    this.name = 'HumanCheckError';
+    this.humanCheck = info;
+  }
+}
+
+/** An operator cancelled the job in Engage while it was running. Not a failure:
+ *  the job is already marked cancelled, and nothing may overwrite that. */
+export class CancelledError extends Error {
+  constructor() {
+    super('Cancelled by an operator.');
+    this.name = 'CancelledError';
+    this.cancelled = true;
+  }
+}
+
+export function detectHumanCheckInPage() {
+  const PROVIDERS = /recaptcha|hcaptcha|challenges\.cloudflare\.com|turnstile|arkoselabs|funcaptcha|captcha-delivery|geo\.captcha/i;
+  const WORDS =
+    /prove (that )?you('| a)?re (a )?human|prove your humanity|verify (that )?you('| a)?re (a )?human|human verification|are you a (robot|human)|confirm (that )?you('| a)?re (a )?human|complete the (captcha|security check)|i('| a)?m not a robot/i;
+  const url = location.href;
+  // A challenge URL — at the root of the site, never a path segment that could
+  // be a community's name (r/captcha exists).
+  if (/^https?:\/\/[^/]+\/(captcha|challenge)(\/|\?|#|$)|challenge-platform|cdn-cgi\/challenge/i.test(url)) {
+    return { reason: 'challenge page', url, text: document.title.slice(0, 120) };
+  }
+
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 30 || r.height < 30) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) > 0.05;
+  };
+  const queue = [document];
+  while (queue.length) {
+    const root = queue.shift();
+    for (const f of root.querySelectorAll('iframe[src], iframe[title]')) {
+      const tell = `${f.getAttribute('src') || ''} ${f.getAttribute('title') || ''}`;
+      if (PROVIDERS.test(tell) && visible(f)) return { reason: 'CAPTCHA', url, text: (f.getAttribute('title') || '').slice(0, 120) };
+    }
+    // Only inside a dialog. A post in a feed can be TITLED "are you a robot?",
+    // and halting an account over a headline would be its own failure.
+    for (const d of root.querySelectorAll('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]')) {
+      if (d.tagName === 'DIALOG' && !d.open) continue;
+      const text = (d.textContent || '').trim().replace(/\s+/g, ' ');
+      if (text && text.length < 600 && WORDS.test(text) && visible(d)) return { reason: 'verification prompt', url, text: text.slice(0, 160) };
+    }
+    for (const n of root.querySelectorAll('*')) if (n.shadowRoot) queue.push(n.shadowRoot);
+  }
+  // A whole page that IS the check: its title says so, or its main heading
+  // does on a page with almost nothing else on it. Never body text alone — a
+  // feed post can be titled "are you a robot?" (caught by the test page).
+  if (WORDS.test(document.title)) return { reason: 'verification page', url, text: document.title.slice(0, 160) };
+  const body = (document.body ? document.body.innerText : '').trim();
+  const heading = document.querySelector('h1, h2');
+  const headingText = heading ? (heading.textContent || '').trim().replace(/\s+/g, ' ') : '';
+  if (body.length < 800 && headingText.length < 120 && WORDS.test(headingText)) {
+    return { reason: 'verification page', url, text: headingText };
+  }
+  return null;
+}
+
+/** The check on screen, or null. Never throws. */
+export async function detectHumanCheck(page) {
+  return page.evaluate(detectHumanCheckInPage).catch(() => null);
+}
+
+/** The element that REALLY has focus, piercing open shadow roots.
+ *  document.activeElement alone reports the shadow HOST (e.g. faceplate-textarea-input)
+ *  when the caret is in a nested <textarea>, so a naive check reads as "not focused".
+ *  Returns a descriptor: { chain, tag, id, contenteditable, placeholder, lexical, inComposer }. */
+export async function deepActiveElement(page) {
+  return page
+    .evaluate(() => {
+      const chain = [];
+      let el = document.activeElement;
+      while (el) {
+        chain.push(el.tagName.toLowerCase() + (el.id ? `#${el.id}` : ''));
+        const next = el.shadowRoot && el.shadowRoot.activeElement;
+        if (!next || next === el) break;
+        el = next;
+      }
+      if (!el) return { chain: ['none'], tag: '', id: '', inComposer: false };
+      // climb light parents AND shadow hosts looking for the comment composer
+      let node = el;
+      let inComposer = false;
+      for (let i = 0; i < 15 && node; i++) {
+        const tag = node.tagName && node.tagName.toLowerCase();
+        if (tag === 'comment-composer-host') { inComposer = true; break; }
+        if (tag === 'shreddit-composer' && node.getAttribute('event-source') === 'comment_composer') { inComposer = true; break; }
+        node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+      }
+      return {
+        chain,
+        tag: el.tagName.toLowerCase(),
+        id: el.id || '',
+        contenteditable: el.getAttribute ? el.getAttribute('contenteditable') : null,
+        placeholder: el.getAttribute ? el.getAttribute('placeholder') : null,
+        lexical: !!(el.hasAttribute && el.hasAttribute('data-lexical-editor')),
+        inComposer,
+      };
+    })
+    .catch(() => null);
+}
+
+/** Answer browser dialogs automatically, so nothing ever waits on a human.
+ *
+ *  THE ONE THAT MATTERS IS `beforeunload`: "Reload site? Changes you made may not
+ *  be saved." Reddit registers it as soon as there's text in the composer, so it
+ *  fires whenever we navigate away from a thread we typed into — the next job's
+ *  open_home, a direct-nav fallback, or a reload after a dry run.
+ *
+ *  Puppeteer does NOT dismiss dialogs for you: `#onDialog` only emits the event.
+ *  With no listener the dialog stays open and the tab is stuck until someone
+ *  clicks it by hand — which is exactly the wedge this fixes.
+ *
+ *  accept() on a beforeunload means "leave the page" (the blue Reload/Leave
+ *  button). Anything else — an unexpected alert or confirm — is DISMISSED
+ *  instead: cancelling is the conservative answer to a prompt we didn't expect. */
+/**
+ * Drop the subreddit scope from the header search box.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * WHY THIS EXISTS. Opening the search box while standing inside r/X silently
+ * scopes the query to r/X. The box shows a `r/X ×` pill, the placeholder reads
+ * "Search in r/X", and the host element carries it outright:
+ *
+ *   <reddit-search-large scope='{"type":"community","name":"passive_income"}'>
+ *     <rpl-input-chip id="search-input-remove-filter"
+ *        aria-label="Remove r/passive_income filter and expand search to all of Reddit">
+ *
+ * So a search meant to FIND A DIFFERENT COMMUNITY searches inside the current
+ * one and cannot possibly succeed. Seen live: a warm-up searched "passive incom"
+ * from within r/howearnmoneyonline, surfaced nothing, and fell back to a direct
+ * visit; a later search_subreddit for r/passive_income lost its Communities-tab
+ * route the same way and recovered only by luck.
+ *
+ * Affects POSTING as well as warm-up — searchSubreddit runs this too. It has been
+ * invisible there because a posting plan always opens on Home first, where there
+ * is no scope to inherit.
+ *
+ * Clicking the pill is what a person does, and its own aria-label says it
+ * "expands search to all of Reddit". Best-effort: no scope, or an unclickable
+ * pill, simply returns false and the caller carries on.
+ *
+ * DO NOT READ THE `scope` ATTRIBUTE TO DECIDE THIS. It is a STATIC initial
+ * attribute, like `initial-query` — it still reads `passive_income` long after
+ * the filter has been removed, the pill is gone from the DOM and the placeholder
+ * has gone back to "Find anything". The first version of this function checked
+ * it and reported failure on a clear that had actually worked. THE PILL'S
+ * PRESENCE IS THE SCOPE; nothing else about it is live.
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+const SCOPE_PILL = ['#search-input-remove-filter', 'rpl-input-chip.scoped-search-pill'];
+
+export async function clearSearchScope(page, log = () => {}) {
+  const pill = await deepQueryHandle(page, SCOPE_PILL);
+  if (!pill) return false; // not scoped — nothing to do
+
+  const name = await pill
+    .evaluate((el) => (el.textContent || '').trim().slice(0, 40))
+    .catch(() => '');
+
+  // CLICK THE SHADOW-ROOT <button>, NOT THE HOST. Measured live: the host sits
+  // at x=722 width 154, while the real button inside starts at x=734 width 136 —
+  // so a small padX from the host's left edge lands in the chip's border and
+  // does nothing at all. Verified: a positional click on the host left the pill
+  // in place; the same click on the inner button removes it.
+  //
+  // Exactly the same shape as the join control (host 70x17, button 70x32). When
+  // Reddit wraps a control in a custom element, the clickable thing is inside.
+  const target = (await pill.evaluateHandle((el) => (el.shadowRoot && el.shadowRoot.querySelector('button')) || el).catch(() => null)) || pill;
+
+  await humanClickHandle(page, target, { padX: [10, 40], padY: [4, 12] });
+  await sleep(rand(400, 1100));
+
+  if (!(await deepQueryHandle(page, SCOPE_PILL))) {
+    log(`search: cleared the ${name || 'community'} filter so the query covers all of Reddit.`);
+    return true;
+  }
+
+  // FALLBACK: go Home. The pill does not always take a synthetic positional
+  // click, and the alternative — a programmatic el.click() — dispatches an
+  // UNTRUSTED event, which is precisely the kind of signal this whole system
+  // exists not to emit. Reddit's front page carries no scope, so landing there
+  // resets it by construction, and clicking the logo on the way to searching
+  // something unrelated is an entirely ordinary thing to do.
+  //
+  // Every caller navigates away as part of searching anyway, so this costs a
+  // page load and nothing else.
+  log(`search: the ${name || 'community'} filter would not clear — going Home to drop it.`);
+  await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await sleep(rand(1200, 2600));
+
+  if (await deepQueryHandle(page, SCOPE_PILL)) {
+    log('search: still scoped after going Home — the query may be narrowed.');
+    return false;
+  }
+  return true;
+}
+
+export function autoHandleDialogs(page, log = () => {}) {
+  page.on('dialog', async (dialog) => {
+    const type = dialog.type();
+    try {
+      if (type === 'beforeunload') {
+        await dialog.accept();
+        log('dialog: "leave page?" — accepted automatically (the composer had unsaved text).');
+      } else {
+        await dialog.dismiss();
+        log(`dialog: unexpected ${type} — dismissed automatically ("${String(dialog.message()).slice(0, 80)}").`);
+      }
+    } catch {
+      /* the dialog can vanish on its own if the page navigates first */
+    }
+  });
+}
+
+/** Run `fn` but reject if it exceeds `ms`. Used by the executor for per-step
+ *  timeouts so a wedged interaction fails the job instead of hanging forever. */
+export function withTimeout(promise, ms, label = 'step') {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+/**
+ * Start reading a thread from the top.
+ *
+ * A person opening a post lands at its top. The agent does not always: it
+ * reuses its own tab, which a dry run leaves scrolled down at the reply box, and
+ * sites restore "where you left off" (the Shopify Community reopens a thread at
+ * your last-read post). Reading from there was a dwell at the bottom followed
+ * straight by typing — seen live 2026-09-17. So a page more than `threshold`px
+ * down is put back at the top first, the way a freshly opened post starts.
+ */
+export async function startReadingAtTop(page, { log = () => {}, label = 'read', threshold = 250 } = {}) {
+  const y = await page.evaluate(() => window.scrollY).catch(() => 0);
+  if (y < threshold) return { reset: false, from: Math.round(y) };
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' })).catch(() => {});
+  await sleep(rand(700, 1500));
+  log(`${label}: the page opened ${Math.round(y)}px down (a reused tab or the site's "where you left off") — starting from the top.`);
+  return { reset: true, from: Math.round(y) };
+}

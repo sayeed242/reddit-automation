@@ -1,0 +1,8 @@
+node_modules/
+.env
+service-account.json
+*.png
+!appicon-1024.png
+Motherlink Agent.app/
+.agent-tabs.json
+.agent-tabs.json.*.tmp

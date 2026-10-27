@@ -1,0 +1,74 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# next.js
+.next/
+out/
+build/
+next-env.d.ts
+*.tsbuildinfo
+
+# env files — never commit
+.env
+.env.*
+!.env.example
+
+# secrets — service-account keys live in ~/.config/motherlink-engage/, never here.
+# These patterns are belt-and-braces in case one is ever downloaded into the repo.
+*service-account*.json
+*serviceaccount*.json
+*-firebase-adminsdk-*.json
+*.pem
+*.key
+.secrets/
+
+# firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+database-debug.log
+
+# electron build output
+desktop/dist/
+
+# agent runtime artifacts
+agent/last-attempt.png
+agent/*.png
+agent/*.log
+
+# backups — contain real production client data, user emails, and draft bodies.
+# Never commit. Keep them on disk / in your own encrypted storage.
+backups/
+tools/backups/
+
+# Encrypted ops vault — purchase records, proxy endpoints, account credentials.
+# AES-256-GCM behind a master password, but the repo is PUBLIC: a leak means
+# unlimited offline brute force against that one passphrase. Directory-level
+# ignore first, filename patterns as belt-and-braces for stray copies/downloads.
+private/
+*vault*.html
+proxies.txt
+
+# misc
+.DS_Store
+.vercel
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Poster-agent macOS app bundle (build artifact; machine-specific path baked in)
+apps/poster-agent/Motherlink Agent.app/
+
+# Google Drive for Desktop upload staging. Drive mirrors this repo and drops
+# partial-upload blobs here; they are machine-local junk, never source.
+.tmp.driveupload/
+
+# Internal working docs — handoff log, plans, migration notes. Kept on disk
+# only: the repo is public, and these carry posting identities, the
+# anti-detection reasoning and operational weak points. NOTE: they are
+# therefore NOT backed up by git. Keep your own copy.
+docs/

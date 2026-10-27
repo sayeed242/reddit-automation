@@ -1,0 +1,74 @@
+import { auth } from '@/lib/firebase/config';
+
+// Client -> our API.
+//
+// Every request carries a bearer token, because every route handler requires
+// one. There is no unauthenticated path into this API, which is the single
+// biggest difference from ML Studio: its four Reddit routes and its invitation
+// relay accept anonymous calls from anyone on the internet.
+
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    /** The parsed error payload, when there was one.
+     *
+     *  Some failures carry structure a caller needs to ACT on rather than only
+     *  display — knowledge ingestion returns `{ code, canPaste }` so the UI can
+     *  tell "the site refused us, a person could paste it" apart from "that URL
+     *  is not allowed". Losing the body meant every failure looked the same. */
+    readonly body?: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const user = auth.currentUser;
+  if (!user) throw new ApiError(401, 'You are not signed in.');
+
+  const send = (token: string) =>
+    fetch(path, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...(init.headers ?? {}),
+      },
+    });
+
+  let res = await send(await user.getIdToken());
+  // A 401 here is almost always a token that ran out while the computer slept:
+  // a page left open overnight fires its refresh timer the moment the machine
+  // wakes, before Firebase has renewed the token it was holding, and the server
+  // logs "Firebase ID token has expired" (seen 2026-10-27). Force a fresh token
+  // and try once more; a second 401 is real and is reported as before.
+  if (res.status === 401) res = await send(await user.getIdToken(true));
+
+  let payload: unknown = null;
+  try {
+    payload = await res.json();
+  } catch {
+    // Fall through: a non-JSON body from an error page shouldn't mask the status.
+  }
+
+  if (!res.ok) {
+    const message =
+      (payload as { error?: string } | null)?.error ?? `Request failed (${res.status}).`;
+    throw new ApiError(res.status, message, payload);
+  }
+
+  return payload as T;
+}
+
+export const apiGet = <T>(path: string) => apiFetch<T>(path);
+
+export const apiPost = <T>(path: string, body: unknown) =>
+  apiFetch<T>(path, { method: 'POST', body: JSON.stringify(body) });
+
+export const apiPut = <T>(path: string, body: unknown) =>
+  apiFetch<T>(path, { method: 'PUT', body: JSON.stringify(body) });
+
+export const apiPatch = <T>(path: string, body: unknown) =>
+  apiFetch<T>(path, { method: 'PATCH', body: JSON.stringify(body) });

@@ -1,0 +1,171 @@
+import 'server-only';
+
+import { FieldValue } from 'firebase-admin/firestore';
+import { adminDb } from './admin';
+import { composeCommentRoute } from '@/modules/reddit/approach';
+import { getSheetConfig, redditSheetPayload } from './sheets';
+import { browseLeadMeta, type BrowseLead } from '@/modules/reddit/browseLead';
+import { wakeAgent } from '@/server/agentWake';
+import { cancelAutopilotCommentsToday } from './autopilotQuota';
+
+// The post queue — jobs the (future) local agent drains to post on Reddit.
+//
+// Top-level, like accounts: one agent drains one global queue across all
+// clients. A job is fully denormalised so the agent needs no extra reads — it
+// carries the thread URL, the AdsPower profile to open, the username to verify,
+// and the reply body.
+//
+// Enqueuing is server-only and gated on drafts.publish (the irreversible tier).
+// Writing a job does NOT post anything by itself — nothing posts until a local
+// agent is wired to this database and drains the queue. Engage's queue is a
+// different Firebase project from ML Studio's, so ML Studio's agent can't see
+// it. Account counters are advanced by the agent on a real successful post, not
+// here.
+
+const jobs = () => adminDb().collection('jobs');
+
+export interface EnqueueInput {
+  projectId: string;
+  draftId: string;
+  itemId: string; // composite post id "<projectId>_<redditPostId>"
+  redditPostId: string; // bare reddit id, for the agent's thread check
+  subreddit: string;
+  threadUrl: string; // full reddit thread URL to navigate to
+  // The post we're replying to, denormalised so the account Dashboard's in-app
+  // reader can always show the original context — even after the item is purged
+  // (purge only protects a post once its draft is posted; a job may outlive it).
+  postTitle: string;
+  postBody: string;
+  postAuthor: string;
+  body: string; // the reply to type
+  // The analysis this reply was written from. Carried so the Google Sheet row
+  // can quote it — see server/sheets.ts. Not used for posting.
+  analysisId: string;
+  accountId: string;
+  adsPowerProfileId: string;
+  expectedUsername: string; // agent aborts if the open profile isn't this handle
+  // The browsing session that runs before the approach — see
+  // modules/reddit/browseLead.ts. An empty plan means none, and why is on it.
+  browseLead: BrowseLead;
+  // What is known about this community on this account — see routeHints in
+  // modules/reddit/joined.ts. Decides which ways in the plan may choose from.
+  routeHints: { joined: boolean; inRecent: boolean };
+  createdBy: string;
+  createdByName: string;
+}
+
+/** True if this draft already has a job that hasn't finished — so we never
+ *  double-queue the same reply. Filtered in memory to avoid a composite index. */
+export async function hasActiveJobForDraft(draftId: string): Promise<boolean> {
+  const snap = await jobs().where('draftId', '==', draftId).get();
+  return snap.docs.some((d) => {
+    const s = d.data().status;
+    return s === 'queued' || s === 'posting';
+  });
+}
+
+/** Cancel a job that hasn't finished. Only queued/posting jobs are cancellable —
+ *  a posted job stays posted, and a failed/cancelled one is already terminal.
+ *  Scoped to the job's own project so one project can't cancel another's work.
+ *  Returns the outcome so the route can give a precise message. */
+export async function cancelJob(
+  jobId: string,
+  projectId: string,
+): Promise<'cancelled' | 'not-found' | 'wrong-project' | 'already-terminal'> {
+  const ref = jobs().doc(jobId);
+  const snap = await ref.get();
+  if (!snap.exists) return 'not-found';
+  const data = snap.data() as { projectId?: string; status?: string };
+  if (data.projectId !== projectId) return 'wrong-project';
+  if (data.status !== 'queued' && data.status !== 'posting') return 'already-terminal';
+  await ref.update({
+    status: 'cancelled',
+    completedAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  return 'cancelled';
+}
+
+export async function enqueuePostJob(input: EnqueueInput): Promise<string> {
+  const ref = jobs().doc();
+  // The tracking-sheet row, decided HERE and frozen onto the job for the same
+  // reason the approach plan is: what the row says about this reply must be
+  // what was true when the reply was written. The agent appends it once the
+  // comment is really up. Null when this project logs to no sheet, and
+  // `sheetStatus` then says 'off' so nothing sweeps for it forever.
+  const cfg = await getSheetConfig(input.projectId);
+  const sheetRow = await redditSheetPayload({
+    projectId: input.projectId,
+    subreddit: input.subreddit,
+    postTitle: input.postTitle,
+    postBody: input.postBody,
+    analysisId: input.analysisId,
+    body: input.body,
+    cfg,
+  });
+  // The humanized itinerary this reply will be posted through, decided HERE and
+  // frozen onto the job: which route through search, how long it reads, how many
+  // comments it skims, whether it upvotes and where. Composing it at enqueue time
+  // is what makes it showable read-only before it runs — the agent re-rolls
+  // nothing, it just walks the list. (An agent that receives a job without one —
+  // queued before this existed — composes its own fallback.)
+  //
+  // When a browse lead runs first — or the account has only just finished a
+  // warm-up session — the plan starts at the search bar: the account is already
+  // on Reddit, and landing on Home a second time is the fixed opening the lead
+  // replaces.
+  //
+  // The route may also be two visits — a look-in before the lead, and the
+  // approach after it (composeCommentRoute). `firstVisitPlan` is empty on a
+  // one-visit job, which is most of them.
+  const lead = input.browseLead;
+  const route = composeCommentRoute({
+    subreddit: input.subreddit,
+    redditPostId: input.redditPostId,
+    threadUrl: input.threadUrl,
+    arrivesBrowsing: lead.plan.length > 0 || lead.skipped === 'recent-warmup',
+    hasLead: lead.plan.length > 0,
+    ...input.routeHints,
+  });
+  const approachPlan = route.approach;
+  await ref.set({
+    jobId: ref.id,
+    // The queue is no longer posting-only. Written explicitly so the agent never
+    // has to infer it; existing docs without the field read as 'post' agent-side,
+    // which is what they are.
+    kind: 'post',
+    approachPlan,
+    firstVisitPlan: route.firstVisit,
+    routeShape: route.shape,
+    browsePlan: lead.plan,
+    browseMeta: browseLeadMeta(lead),
+    projectId: input.projectId,
+    postId: input.itemId,
+    draftId: input.draftId,
+    redditPostId: input.redditPostId,
+    subreddit: input.subreddit,
+    threadUrl: input.threadUrl,
+    postTitle: input.postTitle,
+    postBody: input.postBody,
+    postAuthor: input.postAuthor,
+    accountId: input.accountId,
+    adsPowerProfileId: input.adsPowerProfileId,
+    expectedUsername: input.expectedUsername,
+    body: input.body,
+    ...(sheetRow ? { sheetRow } : {}),
+    sheetStatus: sheetRow ? 'pending' : 'off',
+    sheetAttempts: 0,
+    status: 'queued',
+    attempts: 0,
+    createdBy: input.createdBy,
+    createdByName: input.createdByName,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  // Project work comes first: this reply uses the account's comment for today,
+  // so the autopilot's comments still waiting for it today are cancelled.
+  await cancelAutopilotCommentsToday(input.accountId);
+  // Start the cloud server if it is asleep. Never throws; see agentWake.ts.
+  await wakeAgent('reply queued');
+  return ref.id;
+}

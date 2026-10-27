@@ -1,0 +1,232 @@
+rules_version = '2';
+
+// Motherlink Engage — Firestore security rules
+//
+// Posture, and how it differs from ML Studio:
+//
+//   ML Studio: every Reddit collection is `allow read, write: if isSignedIn()`,
+//   so any signed-in user can read and write every client's data. The deployed
+//   rules were worse still — `allow read, write: if true`.
+//
+//   Engage: DEFAULT DENY. Reads are scoped to project membership. Clients
+//   cannot write ANYTHING. Every mutation goes through a route handler that
+//   verifies the caller's ID token and checks their permission before acting;
+//   the server uses the Admin SDK, which bypasses these rules by design.
+//
+// So `allow write: if false` is not an oversight — it is the point. These rules
+// are defence-in-depth behind the server tier, not the only line of defence.
+//
+// Global role lives in a custom claim (request.auth.token.role) so the common
+// checks cost no document read. Per-project permissions live in
+// projects/{id}/members/{uid} because a user on many projects would blow the
+// 1000-byte custom-claim limit.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- Helpers ----
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Global platform role, mirrored into a custom claim at user creation.
+    function role() {
+      return isSignedIn() ? request.auth.token.get('role', 'member') : '';
+    }
+
+    function isPlatformAdmin() {
+      return role() == 'owner' || role() == 'admin';
+    }
+
+    function memberPath(pid) {
+      return /databases/$(database)/documents/projects/$(pid)/members/$(request.auth.uid);
+    }
+
+    function isMember(pid) {
+      return isSignedIn() && exists(memberPath(pid));
+    }
+
+    // Explicit per-project permission. Costs one document read, so it is used
+    // only where membership alone is too coarse.
+    function can(pid, perm) {
+      return isMember(pid) && get(memberPath(pid)).data.permissions.hasAny([perm]);
+    }
+
+    // ---- Users ----
+    // A user reads their own profile. Platform admins read any.
+    // Writes are server-only: roleSlug/status must never be client-settable,
+    // which is exactly the escalation ML Studio's `allow create: if isSignedIn()`
+    // left open.
+
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isPlatformAdmin());
+      allow write: if false;
+    }
+
+    // ---- Projects ----
+    // One project per client. Membership is the isolation boundary.
+
+    match /projects/{pid} {
+      allow read: if isMember(pid) || isPlatformAdmin();
+      allow write: if false;
+
+      // Members can see who else is on the project.
+      match /members/{uid} {
+        allow read: if isMember(pid) || isPlatformAdmin();
+        allow write: if false;
+      }
+
+      // Everything else under a project — modules/, sources/, items/,
+      // analyses/, drafts/ — requires project.view.
+      //
+      // This recursive wildcard is why the data model nests under projects/:
+      // per-project isolation becomes one rule instead of a get() on every
+      // flat document.
+      match /{document=**} {
+        allow read: if can(pid, 'project.view') || isPlatformAdmin();
+        allow write: if false;
+      }
+    }
+
+    // Collection-group read on members, so the client can find its OWN
+    // memberships in one query (which projects am I on?) rather than proxying
+    // that through the server.
+    //
+    // A collection-group query is NOT covered by the nested members rule above
+    // — it needs its own rule with the recursive prefix.
+    //
+    // The condition keys on the `uid` FIELD, not the document id, and this is
+    // deliberate: Firestore's query-security analysis can only permit a
+    // collection-group query when the rule condition matches the query's own
+    // filter. The client must query `where('uid','==', myUid)`, and the rule
+    // then proves every returnable document satisfies it. Keying on the
+    // document id instead looks equivalent but the analyzer rejects it, because
+    // it cannot connect a doc-id constraint to a field filter.
+    //
+    // Net effect: a user can list their own membership documents and nothing
+    // else. An unfiltered scan, or a filter for someone else's uid, is denied.
+    // The nested rule still governs reading a project's full roster.
+    match /{path=**}/members/{memberId} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // ---- Posting accounts ----
+    // Deliberately top-level, not per-project: one Reddit identity posts across
+    // several clients, and its rate rails are global to the identity.
+    //
+    // Readable by any signed-in user because the picker needs them and they
+    // hold NO credentials — Reddit sessions live in AdsPower profile state, not
+    // here. Mutations require accounts.manage, enforced server-side.
+
+    match /accounts/{accountId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+
+      // Reddit-side stat history (karma/subscriptions over time), captured
+      // in-session by the agent via the Admin SDK. Same read posture as the
+      // parent account doc (no secrets); client writes denied.
+      match /statSnapshots/{snapshotId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+
+      // Warm-up browsing sessions — the composed plan plus the agent's trace of
+      // what it actually managed. Same posture as statSnapshots: written only by
+      // the agent through the Admin SDK, readable by any signed-in user because
+      // it carries no secrets (step names, timings, skip reasons).
+      match /warmupRuns/{runId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+
+      // Comment-karma scans — one record per scan, whether or not it produced a
+      // comment. Read posture matches the parent: it carries no credentials,
+      // only a public Reddit thread, the comment text and why the system did or
+      // did not want to post it.
+      //
+      // WRITES ARE SERVER-ONLY AND THIS ONE MATTERS MORE THAN THE OTHERS. The
+      // status field on these documents is what Phase 5's enqueue will read to
+      // decide that a comment was approved. A client able to write here could
+      // approve its own text and have a real Reddit identity post it — so the
+      // approval path stays behind the `accounts.manage` route, exactly like
+      // publishing a draft.
+      match /commentDrafts/{draftId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+    }
+
+    // ---- Job queue ----
+    // Top-level so one agent drains one queue. A job carries the draft body, so
+    // reads are scoped to members of the job's project.
+    //
+    // In ML Studio this collection had NO rule at all while the deployed rules
+    // were allow-all: world-writable, drained by an agent with admin rights
+    // onto real Reddit accounts. Enqueueing here is server-only.
+
+    match /jobs/{jobId} {
+      allow read: if isSignedIn() && (isPlatformAdmin() || isMember(resource.data.projectId));
+      allow write: if false;
+    }
+
+    // ---- Agent heartbeat ----
+    // Written solely by the local agent via the Admin SDK.
+
+    match /agents/{agentId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    // ---- Activity logs ----
+
+    match /activity_logs/{logId} {
+      allow read: if isPlatformAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // ---- Invitations ----
+    // Fully server-side. No client read at any limit.
+    //
+    // ML Studio allowed `read: if request.query.limit == 1` so unauthenticated
+    // signup could look up a token — which also let anyone page through
+    // invitations one at a time and harvest tokens. Engage exchanges the token
+    // through a route handler against a stored hash instead, so the client
+    // never needs to read this collection.
+
+    match /invitations/{invId} {
+      allow read, write: if false;
+    }
+
+    // ---- LLM provider credentials ----
+    // Encrypted third-party API keys (DeepSeek, OpenRouter). No client read at
+    // ANY scope — not the owner of a personal key, not a platform admin. The
+    // settings page gets masked metadata from /api/llm/credentials instead,
+    // which is the one place this app reads through a route rather than direct.
+    //
+    // TOP-LEVEL BY NECESSITY, NOT BY TASTE. `match /projects/{pid}/{document=**}`
+    // above grants read on project.view, and rules are a UNION of grants — a
+    // nested `allow read: if false` would NOT revoke it. Moving this under a
+    // project would hand every project member the stored credential. There is a
+    // test that proves exactly this in tests/rules.test.mjs; read it before
+    // "tidying" this collection anywhere else.
+
+    match /llmCredentials/{credentialId} {
+      allow read, write: if false;
+    }
+
+    // ---- Drafting instructions (platform scope) ----
+    // The house style every project's replies are written under. Read and
+    // written only through /api/drafting-instructions, which checks platform
+    // admin — so no client access at any scope, like llmCredentials above.
+    //
+    // A project's OWN instructions live at projects/{pid}/draftingInstructions
+    // and are deliberately NOT here: they are ordinary project data, readable
+    // by members under the project.view rule and writable only by the server.
+    match /draftingInstructions/{instructionId} {
+      allow read, write: if false;
+    }
+
+    // No catch-all match. Anything not named above is denied.
+  }
+}

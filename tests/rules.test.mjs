@@ -1,0 +1,521 @@
+// Firestore security-rules tests for Motherlink Engage.
+//
+// These exist to prove the central claim of the migration: that a user with
+// access to one client's project cannot reach another client's data. In ML
+// Studio that claim is false by construction — every Reddit collection is
+// `allow read, write: if isSignedIn()`, so any signed-in user sees every
+// client. This file is how we stop taking that on faith.
+//
+// Run:  cd tests && npm test
+// (firebase emulators:exec starts a Firestore emulator around `node --test`)
+
+import { test, before, after, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  initializeTestEnvironment,
+  assertFails,
+  assertSucceeds,
+} from '@firebase/rules-unit-testing';
+import {
+  doc,
+  getDoc,
+  setDoc,
+  collection,
+  collectionGroup,
+  query,
+  where,
+  getDocs,
+  deleteDoc,
+} from 'firebase/firestore';
+import { readFileSync } from 'node:fs';
+
+let testEnv;
+
+const ALICE = 'uid_alice'; // member of project A
+const BOB = 'uid_bob'; // member of project B
+const CAROL = 'uid_carol'; // member of project A, but WITHOUT project.view
+const ADMIN = 'uid_admin'; // platform admin
+const PROJECT_A = 'proj_acme';
+const PROJECT_B = 'proj_globex';
+
+const FULL = [
+  'project.view',
+  'project.edit',
+  'items.fetch',
+  'items.analyze',
+  'drafts.generate',
+  'drafts.approve',
+  'drafts.publish',
+];
+
+before(async () => {
+  testEnv = await initializeTestEnvironment({
+    projectId: 'motherlink-engage-test',
+    firestore: {
+      rules: readFileSync(new URL('../firestore.rules', import.meta.url), 'utf8'),
+      host: '127.0.0.1',
+      port: 8080,
+    },
+  });
+
+  // Seed with rules disabled — this is fixture setup, not a test.
+  await testEnv.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+
+    await setDoc(doc(db, 'users', ALICE), { uid: ALICE, email: 'alice@x.io', role: 'member' });
+    await setDoc(doc(db, 'users', BOB), { uid: BOB, email: 'bob@x.io', role: 'member' });
+    await setDoc(doc(db, 'users', CAROL), { uid: CAROL, email: 'carol@x.io', role: 'member' });
+
+    await setDoc(doc(db, 'projects', PROJECT_A), { name: 'Acme', enabledModules: ['reddit'] });
+    await setDoc(doc(db, 'projects', PROJECT_B), { name: 'Globex', enabledModules: ['reddit'] });
+
+    await setDoc(doc(db, 'projects', PROJECT_A, 'members', ALICE), { uid: ALICE, permissions: FULL });
+    await setDoc(doc(db, 'projects', PROJECT_B, 'members', BOB), { uid: BOB, permissions: FULL });
+    // Carol is a member of A but has no project.view.
+    await setDoc(doc(db, 'projects', PROJECT_A, 'members', CAROL), {
+      uid: CAROL,
+      permissions: ['analytics.view'],
+    });
+
+    await setDoc(doc(db, 'projects', PROJECT_A, 'modules', 'reddit'), {
+      targetSubreddits: ['budget'],
+    });
+    await setDoc(doc(db, 'projects', PROJECT_A, 'items', 'item_1'), {
+      platform: 'reddit',
+      title: 'acme post',
+    });
+    await setDoc(doc(db, 'projects', PROJECT_B, 'items', 'item_2'), {
+      platform: 'reddit',
+      title: 'globex post',
+    });
+    // A Covers item and the posts subcollection under it — the first nested
+    // collection under items/. Nothing in firestore.rules names it; it is
+    // covered by the recursive wildcard, and these two tests are what prove
+    // that rather than assume it.
+    await setDoc(doc(db, 'projects', PROJECT_A, 'items', 'item_covers'), {
+      platform: 'covers',
+      title: 'Week 1 bets and line moves',
+    });
+    await setDoc(doc(db, 'projects', PROJECT_A, 'items', 'item_covers', 'posts', '133914868'), {
+      author: 'brn2loslive2win',
+      body: 'Sea -3.5',
+    });
+    await setDoc(doc(db, 'projects', PROJECT_B, 'items', 'item_covers_b', 'posts', '133914999'), {
+      author: 'someone_else',
+      body: 'Phi -4.5',
+    });
+    await setDoc(doc(db, 'projects', PROJECT_A, 'drafts', 'draft_1'), { body: 'hi', status: 'draft' });
+    await setDoc(doc(db, 'projects', PROJECT_B, 'drafts', 'draft_2'), { body: 'yo', status: 'draft' });
+
+    await setDoc(doc(db, 'accounts', 'acct_1'), { label: 'Growth', username: 'budgetlee_app' });
+    await setDoc(doc(db, 'accounts', 'acct_1', 'commentDrafts', 'draft_1'), {
+      draftId: 'draft_1',
+      status: 'pending',
+      text: 'took me about six months',
+    });
+    await setDoc(doc(db, 'jobs', 'job_a'), { projectId: PROJECT_A, status: 'queued', body: 'x' });
+    await setDoc(doc(db, 'jobs', 'job_b'), { projectId: PROJECT_B, status: 'queued', body: 'y' });
+    await setDoc(doc(db, 'agents', 'agent'), { pid: 1 });
+    await setDoc(doc(db, 'invitations', 'inv_1'), { email: 'new@x.io', token: 'secret-token' });
+    await setDoc(doc(db, 'activity_logs', 'log_1'), { userId: ALICE, action: 'tool.opened' });
+    await setDoc(doc(db, 'activity_logs', 'log_2'), { userId: BOB, action: 'tool.opened' });
+
+    // An encrypted API key belonging to Alice, plus a decoy nested under
+    // project A that demonstrates the recursive-wildcard trap.
+    await setDoc(doc(db, 'llmCredentials', 'cred_alice'), {
+      credentialId: 'cred_alice',
+      provider: 'deepseek',
+      scope: 'personal',
+      ownerUid: ALICE,
+      keyHint: '••••beef',
+      secret: { v: 1, alg: 'A256GCM', kid: 'deadbeef', salt: 'c2FsdA==', iv: 'aXY=', tag: 'dGFn', ct: 'Y3Q=' },
+    });
+    await setDoc(doc(db, 'projects', PROJECT_A, 'llmCredentials', 'cred_trap'), {
+      note: 'demonstrates why credentials cannot live under a project',
+    });
+  });
+});
+
+after(async () => {
+  await testEnv?.cleanup();
+});
+
+const asAlice = () => testEnv.authenticatedContext(ALICE).firestore();
+const asBob = () => testEnv.authenticatedContext(BOB).firestore();
+const asCarol = () => testEnv.authenticatedContext(CAROL).firestore();
+const asAdmin = () => testEnv.authenticatedContext(ADMIN, { role: 'admin' }).firestore();
+const asAnon = () => testEnv.unauthenticatedContext().firestore();
+
+// ---------------------------------------------------------------------------
+
+describe('cross-project isolation — the claim the migration exists to make true', () => {
+  test('Alice reads her own project', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'projects', PROJECT_A)));
+  });
+
+  test("Alice CANNOT read Bob's project", async () => {
+    await assertFails(getDoc(doc(asAlice(), 'projects', PROJECT_B)));
+  });
+
+  test("Alice CANNOT read Bob's project items", async () => {
+    await assertFails(getDoc(doc(asAlice(), 'projects', PROJECT_B, 'items', 'item_2')));
+  });
+
+  test("Alice CANNOT read Bob's drafts", async () => {
+    await assertFails(getDoc(doc(asAlice(), 'projects', PROJECT_B, 'drafts', 'draft_2')));
+  });
+
+  test("Alice CANNOT read a post inside Bob's harvested thread", async () => {
+    // Two levels deep under projects/{pid}. If the recursive wildcard did not
+    // reach here, this would be a client-readable copy of another client's data.
+    await assertFails(
+      getDoc(doc(asAlice(), 'projects', PROJECT_B, 'items', 'item_covers_b', 'posts', '133914999')),
+    );
+    await assertFails(
+      getDocs(collection(asAlice(), 'projects', PROJECT_B, 'items', 'item_covers_b', 'posts')),
+    );
+  });
+
+  test('Alice reads and lists the posts under her own harvested thread', async () => {
+    await assertSucceeds(
+      getDoc(doc(asAlice(), 'projects', PROJECT_A, 'items', 'item_covers', 'posts', '133914868')),
+    );
+    await assertSucceeds(
+      getDocs(collection(asAlice(), 'projects', PROJECT_A, 'items', 'item_covers', 'posts')),
+    );
+  });
+
+  test("Alice CANNOT list Bob's items", async () => {
+    await assertFails(getDocs(collection(asAlice(), 'projects', PROJECT_B, 'items')));
+  });
+
+  test("Bob CANNOT read Alice's project", async () => {
+    await assertFails(getDoc(doc(asBob(), 'projects', PROJECT_A)));
+  });
+
+  test("Bob CANNOT read Alice's module config", async () => {
+    await assertFails(getDoc(doc(asBob(), 'projects', PROJECT_A, 'modules', 'reddit')));
+  });
+
+  test('Alice reads her own items and drafts', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'projects', PROJECT_A, 'items', 'item_1')));
+    await assertSucceeds(getDoc(doc(asAlice(), 'projects', PROJECT_A, 'drafts', 'draft_1')));
+  });
+
+  test('Alice can LIST her own items/analyses/drafts — the client read path', async () => {
+    // These are the queries the browser now runs directly instead of via the
+    // server. If any of them failed, the review screen would hang.
+    await assertSucceeds(getDocs(collection(asAlice(), 'projects', PROJECT_A, 'items')));
+    await assertSucceeds(getDocs(collection(asAlice(), 'projects', PROJECT_A, 'analyses')));
+    await assertSucceeds(getDocs(collection(asAlice(), 'projects', PROJECT_A, 'drafts')));
+    await assertSucceeds(getDocs(collection(asAlice(), 'projects', PROJECT_A, 'sources')));
+  });
+});
+
+describe('collection-group members read — powers the client "my projects" query', () => {
+  test('Alice can query her own memberships across all projects', async () => {
+    const q = query(collectionGroup(asAlice(), 'members'), where('uid', '==', ALICE));
+    await assertSucceeds(getDocs(q));
+  });
+
+  test("Alice CANNOT query Bob's memberships via collection group", async () => {
+    // The rule keys on the document id being the caller's uid, so filtering by
+    // someone else's uid returns docs the rule forbids -> the query fails.
+    const q = query(collectionGroup(asAlice(), 'members'), where('uid', '==', BOB));
+    await assertFails(getDocs(q));
+  });
+
+  test('an unfiltered collection-group members scan is denied', async () => {
+    await assertFails(getDocs(collectionGroup(asAlice(), 'members')));
+  });
+});
+
+describe('permission granularity within a project', () => {
+  test('Carol is a member but lacks project.view, so cannot read items', async () => {
+    await assertFails(getDoc(doc(asCarol(), 'projects', PROJECT_A, 'items', 'item_1')));
+  });
+
+  test('Carol can still see the project itself and its member list', async () => {
+    await assertSucceeds(getDoc(doc(asCarol(), 'projects', PROJECT_A)));
+    await assertSucceeds(getDoc(doc(asCarol(), 'projects', PROJECT_A, 'members', ALICE)));
+  });
+});
+
+describe('unauthenticated access — ML Studio allowed all of this', () => {
+  test('anon cannot read projects', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'projects', PROJECT_A)));
+  });
+
+  test('anon cannot read items', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'projects', PROJECT_A, 'items', 'item_1')));
+  });
+
+  test('anon cannot read users', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'users', ALICE)));
+  });
+
+  test('anon cannot read accounts', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'accounts', 'acct_1')));
+  });
+
+  test('anon cannot read the job queue', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'jobs', 'job_a')));
+  });
+
+  test('anon CANNOT write a job — the ML Studio hole that let a stranger post from your accounts', async () => {
+    await assertFails(
+      setDoc(doc(asAnon(), 'jobs', 'evil'), { projectId: PROJECT_A, status: 'queued', body: 'spam' }),
+    );
+  });
+});
+
+describe('clients cannot write — every mutation goes through the server tier', () => {
+  test('Alice cannot write to her own project', async () => {
+    await assertFails(setDoc(doc(asAlice(), 'projects', PROJECT_A), { name: 'hacked' }));
+  });
+
+  test('Alice cannot create an item', async () => {
+    await assertFails(setDoc(doc(asAlice(), 'projects', PROJECT_A, 'items', 'new'), { title: 'x' }));
+  });
+
+  test('Alice cannot write a post into her own harvested thread', async () => {
+    // A harvest is a server action. A client that could write posts could put
+    // words in a forum member's mouth inside our own record of the thread.
+    await assertFails(
+      setDoc(doc(asAlice(), 'projects', PROJECT_A, 'items', 'item_covers', 'posts', 'forged'), {
+        author: 'brn2loslive2win',
+        body: 'I love this sportsbook',
+      }),
+    );
+  });
+
+  test('Alice cannot enqueue a job directly, even for her own project', async () => {
+    await assertFails(
+      setDoc(doc(asAlice(), 'jobs', 'mine'), { projectId: PROJECT_A, status: 'queued', body: 'x' }),
+    );
+  });
+
+  test('Alice cannot grant herself permissions', async () => {
+    await assertFails(
+      setDoc(doc(asAlice(), 'projects', PROJECT_A, 'members', ALICE), {
+        uid: ALICE,
+        permissions: [...FULL, 'project.members'],
+      }),
+    );
+  });
+
+  test('Alice cannot add herself to Bob\'s project', async () => {
+    await assertFails(
+      setDoc(doc(asAlice(), 'projects', PROJECT_B, 'members', ALICE), { uid: ALICE, permissions: FULL }),
+    );
+  });
+
+  test('Alice cannot escalate her own global role', async () => {
+    await assertFails(setDoc(doc(asAlice(), 'users', ALICE), { uid: ALICE, role: 'owner' }));
+  });
+
+  test('Alice cannot delete an account record', async () => {
+    await assertFails(deleteDoc(doc(asAlice(), 'accounts', 'acct_1')));
+  });
+
+  test('even a platform admin cannot write from the client', async () => {
+    await assertFails(setDoc(doc(asAdmin(), 'projects', PROJECT_A), { name: 'nope' }));
+  });
+});
+
+describe('invitations are entirely server-side', () => {
+  test('anon cannot read an invitation (ML Studio allowed this at limit 1)', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'invitations', 'inv_1')));
+  });
+
+  test('a signed-in user cannot enumerate invitations to harvest tokens', async () => {
+    await assertFails(getDocs(collection(asAlice(), 'invitations')));
+  });
+
+  test('even a platform admin cannot read invitations from the client', async () => {
+    await assertFails(getDoc(doc(asAdmin(), 'invitations', 'inv_1')));
+  });
+});
+
+describe('platform admin', () => {
+  test('admin reads any project', async () => {
+    await assertSucceeds(getDoc(doc(asAdmin(), 'projects', PROJECT_A)));
+    await assertSucceeds(getDoc(doc(asAdmin(), 'projects', PROJECT_B)));
+  });
+
+  test('admin reads any user', async () => {
+    await assertSucceeds(getDoc(doc(asAdmin(), 'users', ALICE)));
+  });
+
+  test('a plain member cannot read another user profile', async () => {
+    await assertFails(getDoc(doc(asAlice(), 'users', BOB)));
+  });
+
+  test('a user reads their own profile', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'users', ALICE)));
+  });
+});
+
+describe('scoped reads on shared collections', () => {
+  test('Alice reads a job for her project', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'jobs', 'job_a')));
+  });
+
+  test("Alice CANNOT read a job for Bob's project — draft bodies leak otherwise", async () => {
+    await assertFails(getDoc(doc(asAlice(), 'jobs', 'job_b')));
+  });
+
+  // The Opportunities page LIST-queries jobs by project to show each draft's
+  // posting status. Rules evaluate the query shape, so cover it explicitly.
+  test('Alice lists jobs for her own project', async () => {
+    await assertSucceeds(getDocs(query(collection(asAlice(), 'jobs'), where('projectId', '==', PROJECT_A))));
+  });
+
+  test("Alice CANNOT list jobs for Bob's project", async () => {
+    await assertFails(getDocs(query(collection(asAlice(), 'jobs'), where('projectId', '==', PROJECT_B))));
+  });
+
+  test('Alice cannot list the whole jobs queue', async () => {
+    await assertFails(getDocs(collection(asAlice(), 'jobs')));
+  });
+
+  test('any signed-in user reads accounts (no credentials stored there)', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'accounts', 'acct_1')));
+  });
+
+  test('any signed-in user reads the agent heartbeat', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'agents', 'agent')));
+  });
+
+  // The Comment karma tab subscribes to this subcollection live, so the read
+  // has to work for an ordinary member — and the write must not, because the
+  // status on these documents is what Phase 5's enqueue reads to decide a
+  // comment was approved. A client-side write here would be self-approval.
+  test('any signed-in user reads a comment-karma scan', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'accounts', 'acct_1', 'commentDrafts', 'draft_1')));
+    await assertSucceeds(getDocs(collection(asAlice(), 'accounts', 'acct_1', 'commentDrafts')));
+  });
+
+  test('nobody can approve a comment from the client — not even an admin', async () => {
+    await assertFails(
+      setDoc(doc(asAlice(), 'accounts', 'acct_1', 'commentDrafts', 'draft_1'), { status: 'approved' }),
+    );
+    await assertFails(
+      setDoc(doc(asAdmin(), 'accounts', 'acct_1', 'commentDrafts', 'draft_1'), { status: 'approved' }),
+    );
+    await assertFails(
+      setDoc(doc(asAlice(), 'accounts', 'acct_1', 'commentDrafts', 'forged'), {
+        status: 'approved',
+        text: 'buy my thing',
+      }),
+    );
+  });
+});
+
+describe('activity logs', () => {
+  test('a user reads their own log entry', async () => {
+    await assertSucceeds(getDoc(doc(asAlice(), 'activity_logs', 'log_1')));
+  });
+
+  test("a user cannot read someone else's log entry", async () => {
+    await assertFails(getDoc(doc(asAlice(), 'activity_logs', 'log_2')));
+  });
+
+  test('admin reads any log entry', async () => {
+    await assertSucceeds(getDoc(doc(asAdmin(), 'activity_logs', 'log_2')));
+  });
+
+  // The viewer runs LIST queries, which rules evaluate against the query shape,
+  // not one doc — so these are distinct from the get() cases above.
+  test('admin lists the whole collection', async () => {
+    await assertSucceeds(getDocs(collection(asAdmin(), 'activity_logs')));
+  });
+
+  test('a user lists their own entries (filtered by userId)', async () => {
+    await assertSucceeds(
+      getDocs(query(collection(asAlice(), 'activity_logs'), where('userId', '==', ALICE))),
+    );
+  });
+
+  test('a user cannot list the whole collection', async () => {
+    await assertFails(getDocs(collection(asAlice(), 'activity_logs')));
+  });
+
+  test("a user cannot list someone else's entries", async () => {
+    await assertFails(
+      getDocs(query(collection(asAlice(), 'activity_logs'), where('userId', '==', BOB))),
+    );
+  });
+});
+
+describe('unnamed collections are denied by default', () => {
+  test('a made-up collection is unreadable', async () => {
+    await assertFails(getDoc(doc(asAlice(), 'something_new', 'x')));
+  });
+
+  test('a made-up collection is unwritable', async () => {
+    await assertFails(setDoc(doc(asAlice(), 'something_new', 'x'), { a: 1 }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LLM provider credentials.
+//
+// These hold encrypted third-party API keys. Unlike every other collection in
+// this file, there is no client read path at all — the settings page is served
+// masked metadata by /api/llm/credentials. The tests below pin that down, and
+// the last one pins down WHY the collection has to be top-level.
+
+describe('LLM credentials are entirely server-side', () => {
+  test('Alice cannot read her OWN credential', async () => {
+    // The surprising one, and the reason it is first: without this test someone
+    // reasonably concludes "the owner should be able to read her own key" and
+    // opens a hole. She owns it; she still cannot read it. The plaintext only
+    // ever exists inside a route handler.
+    await assertFails(getDoc(doc(asAlice(), 'llmCredentials', 'cred_alice')));
+  });
+
+  test('a platform admin cannot read a credential either', async () => {
+    // Deliberately unlike users/{uid}, which admins CAN read. Being able to
+    // administer a key is not the same as being able to read it.
+    await assertFails(getDoc(doc(asAdmin(), 'llmCredentials', 'cred_alice')));
+  });
+
+  test('another user cannot read it', async () => {
+    await assertFails(getDoc(doc(asBob(), 'llmCredentials', 'cred_alice')));
+  });
+
+  test('an unauthenticated caller cannot read it', async () => {
+    await assertFails(getDoc(doc(asAnon(), 'llmCredentials', 'cred_alice')));
+  });
+
+  test('the collection cannot be listed', async () => {
+    // Tested separately from getDoc: rules evaluate a list query against the
+    // QUERY, not the documents, so a passing getDoc test says nothing about it.
+    await assertFails(getDocs(collection(asAlice(), 'llmCredentials')));
+  });
+
+  test('nobody can create, update or delete a credential from the client', async () => {
+    // Guards against a "let users rotate their own key client-side" shortcut,
+    // which would write plaintext straight past the encryption layer.
+    await assertFails(setDoc(doc(asAlice(), 'llmCredentials', 'cred_new'), { provider: 'deepseek' }));
+    await assertFails(setDoc(doc(asAlice(), 'llmCredentials', 'cred_alice'), { label: 'renamed' }));
+    await assertFails(deleteDoc(doc(asAlice(), 'llmCredentials', 'cred_alice')));
+    await assertFails(setDoc(doc(asAdmin(), 'llmCredentials', 'cred_admin'), { provider: 'deepseek' }));
+  });
+
+  test('THE WILDCARD TRAP: a credential nested under a project IS readable by any member', async () => {
+    // This test asserts a SUCCESS, and that is the point.
+    //
+    // `match /projects/{pid}/{document=**} { allow read: if can(pid,'project.view') }`
+    // grants read on everything under a project, and Firestore rules are a UNION
+    // of grants — adding a narrower `allow read: if false` for a nested path
+    // does NOT take it away. So a credential stored under a project is readable
+    // by every member of that project, and no rule you add alongside will stop it.
+    //
+    // That is the entire reason llmCredentials is a top-level collection. If
+    // someone ever "tidies" it under projects/, this test keeps passing while
+    // the four tests above start failing — and the diff will say why.
+    await assertSucceeds(getDoc(doc(asAlice(), 'projects', PROJECT_A, 'llmCredentials', 'cred_trap')));
+  });
+});
